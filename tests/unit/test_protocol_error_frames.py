@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from epaper_dithering import ColorScheme
@@ -60,9 +61,13 @@ class _ScriptedConn:
 
     def __init__(self, responses: list[bytes | Exception]) -> None:
         self._responses = responses
+        self.writes = 0
 
     async def write_command(self, data: bytes, response: bool = True) -> None:
-        pass
+        self.writes += 1
+
+    def drain_notifications(self) -> int:
+        return 0
 
     async def read_response(self, timeout: float) -> bytes:
         item = self._responses.pop(0)
@@ -90,6 +95,19 @@ def test_interrogate_raises_on_config_read_timeout() -> None:
 
     with pytest.raises(TruncatedConfigError, match="truncated"):
         asyncio.run(device.interrogate())
+
+
+def test_interrogate_retries_first_chunk_timeout_once() -> None:
+    """A first-chunk timeout triggers one READ_CONFIG retry before failing."""
+    device = _make_device()
+    conn = _ScriptedConn([BLETimeoutError(), b"\xff\x40\x00\x00"])
+    device._connection = conn  # type: ignore[assignment]
+
+    with patch("opendisplay.device.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(ProtocolError, match="no stored configuration"):
+            asyncio.run(device.interrogate())
+
+    assert conn.writes == 2
 
 
 def test_interrogate_raises_on_stalled_empty_chunk() -> None:

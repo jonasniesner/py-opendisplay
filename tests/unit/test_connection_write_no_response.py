@@ -45,6 +45,14 @@ async def test_write_command_defaults_to_write_with_response() -> None:
     assert kwargs["response"] is True
 
 
+@pytest.mark.asyncio
+async def test_write_command_opt_out_uses_wnr_when_supported() -> None:
+    conn, client = _make_conn_with_client(supports_wnr=True)
+    await conn.write_command(b"\x00\x40", response=False)
+    _, kwargs = client.write_gatt_char.call_args
+    assert kwargs["response"] is False
+
+
 def _make_client_with_char(properties: list[str]) -> MagicMock:
     char = MagicMock()
     char.properties = properties

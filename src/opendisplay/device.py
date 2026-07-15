@@ -422,6 +422,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
     TIMEOUT_FIRST_CHUNK = 10.0  # First chunk may take longer
     TIMEOUT_CONFIG_CHUNK = 2.0  # Subsequent config read chunks (interrogate)
     TIMEOUT_ACK = 5.0  # Command acknowledgments
+    INTERROGATE_FIRST_CHUNK_RETRY_DELAY_S = 0.2  # Pause before one READ_CONFIG retry
     TIMEOUT_UNCOMPRESSED_DATA_ACK = 90.0  # Uncompressed DATA: bbepWriteData() blocks SPI on Spectra/ACeP (~60s max)
     TIMEOUT_UNCOMPRESSED_END_ACK = 90.0  # Uncompressed END: some firmware variants refresh before replying (~60s max)
     TIMEOUT_COMPRESSED_END_ACK = 90.0  # Compressed END: decompression + full SPI write to IC (~60s on Spectra/ACeP)
@@ -455,6 +456,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         discovery_timeout: float = 10.0,
         max_attempts: int = 4,
         use_services_cache: bool = True,
+        fresh_gatt: bool = False,
         use_measured_palettes: bool = True,
         encryption_key: bytes | None = None,
         blocks_per_ack: int = 8,
@@ -472,6 +474,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             discovery_timeout: Timeout for name resolution scan (default: 10)
             max_attempts: Maximum connection attempts for bleak-retry-connector (default: 4)
             use_services_cache: Enable GATT service caching for faster reconnections (default: True)
+            fresh_gatt: Skip GATT service cache on connect for a one-shot probe through
+                a Bluetooth proxy (default: False). Overrides ``use_services_cache``.
             use_measured_palettes: Use measured color palettes when available (default: True)
             encryption_key: 16-byte AES-128 master key for encrypted devices (optional).
             blocks_per_ack: Requested PIPE_WRITE ACK cadence N (blocks per ack), 1..32
@@ -497,6 +501,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         self._timeout = timeout
         self._max_attempts = max_attempts
         self._use_services_cache = use_services_cache
+        self._fresh_gatt = fresh_gatt
         self._use_measured_palettes = use_measured_palettes
 
         # Will be set after resolution
@@ -564,6 +569,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             self._timeout,
             max_attempts=self._max_attempts,
             use_services_cache=self._use_services_cache,
+            fresh_gatt=self._fresh_gatt,
             disconnected_callback=self._on_ble_disconnect,
         )
 
@@ -659,14 +665,15 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             return frame
         return data
 
-    async def _write(self, data: bytes, response: bool = True) -> None:
+    async def _write(self, data: bytes, response: bool = False) -> None:
         """Write a command, encrypting it if an active session exists.
 
         Args:
             data: Plaintext command frame (opcode + payload).
-            response: Passed through to the transport. False requests a BLE Write
-                Without Response (used for 0x71 data chunks); applies whether or not
-                the frame is encrypted.
+            response: Passed through to the transport. False (default) requests a
+                BLE Write Without Response when supported — matching the web toolbox
+                and avoiding ESP32/proxy stalls on write-with-response for short
+                command/response pairs. True forces a Write Request (ATT confirmation).
         """
         if self._session_key is not None and self._session_id is not None:
             await self._reauthenticate_if_needed()
@@ -755,7 +762,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
 
         # Step 1: Request server nonce (retry once if device reports existing session)
         for attempt in range(2):
-            await self._conn.write_command(build_authenticate_step1())
+            await self._conn.write_command(build_authenticate_step1(), response=False)
             challenge_data = await self._conn.read_response(timeout=self.TIMEOUT_ACK)
             try:
                 server_nonce, device_id = parse_authenticate_challenge(challenge_data)
@@ -768,7 +775,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         # Step 2: Prove key knowledge, receive server proof
         client_nonce = generate_client_nonce()
         challenge = compute_challenge_response(key, server_nonce, client_nonce, device_id)
-        await self._conn.write_command(build_authenticate_step2(client_nonce, challenge))
+        await self._conn.write_command(build_authenticate_step2(client_nonce, challenge), response=False)
         success_response = await self._conn.read_response(timeout=self.TIMEOUT_ACK)
         server_proof = parse_authenticate_success(success_response)  # raises on wrong key / error
 
@@ -945,12 +952,24 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         """
         _LOGGER.debug("Interrogating device %s", self.mac_address)
 
-        # Send read config command
         cmd = build_read_config_command()
-        await self._write(cmd)
-
-        # Read first chunk
-        response = await self._read(self.TIMEOUT_FIRST_CHUNK)
+        response: bytes
+        for attempt in range(2):
+            if attempt > 0:
+                _LOGGER.debug(
+                    "Retrying READ_CONFIG for %s after first-chunk timeout",
+                    self.mac_address,
+                )
+                self._conn.drain_notifications()
+                await asyncio.sleep(self.INTERROGATE_FIRST_CHUNK_RETRY_DELAY_S)
+            await self._write(cmd)
+            try:
+                response = await self._read(self.TIMEOUT_FIRST_CHUNK)
+            except BLETimeoutError:
+                if attempt == 1:
+                    raise
+                continue
+            break
 
         # Firmware answers a device-with-no-config with the 4-byte error frame
         # {0xFF, 0x40, 0x00, 0x00}. Without this check the {0x00,0x00} length
@@ -1021,7 +1040,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
 
         # Send read firmware version command
         cmd = build_read_fw_version_command()
-        await self._conn.write_command(cmd)
+        await self._write(cmd)
 
         # Read response
         response = await self._conn.read_response(timeout=self.TIMEOUT_ACK)
@@ -1881,7 +1900,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             stream_bytes=stream_bytes,
             max_start_payload=max_start,
         )
-        await self._write(start_pkt)
+        await self._write(start_pkt, response=True)
         try:
             response = await self._read(self.TIMEOUT_ACK)
             nack = parse_nack(response)
@@ -1907,7 +1926,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         if await self._send_partial_chunks(remaining, stream_bytes, state, progress_callback) == "fallback_full":
             return "fallback_full"
 
-        await self._write(build_direct_write_end_command(RefreshMode.PARTIAL.value))
+        await self._write(build_direct_write_end_command(RefreshMode.PARTIAL.value), response=True)
         response = await self._read(self.TIMEOUT_ACK)
         validate_ack_response(response, CommandCode.DIRECT_WRITE_END)
 
@@ -1994,7 +2013,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             start_cmd = build_direct_write_start_uncompressed()
             remaining_compressed = None
 
-        await self._write(start_cmd)
+        await self._write(start_cmd, response=True)
 
         # 2. Wait for START ACK — firmware initializes display hardware here, which can be slow
         response = await self._read(self.TIMEOUT_FIRST_CHUNK)
@@ -2021,7 +2040,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
                 )
             use_compression = False
             start_cmd = build_direct_write_start_uncompressed()
-            await self._write(start_cmd)
+            await self._write(start_cmd, response=True)
             response = await self._read(self.TIMEOUT_FIRST_CHUNK)
             validate_ack_response(response, CommandCode.DIRECT_WRITE_START)
 
@@ -2042,7 +2061,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
                 if new_etag is not None
                 else build_direct_write_end_command(refresh_mode.value)
             )
-            await self._write(end_cmd)
+            await self._write(end_cmd, response=True)
 
             # END triggers the SPI write and/or refresh on device before the ACK is sent.
             # Both paths can block up to ~60s on slow displays (Spectra/ACeP).
@@ -2150,7 +2169,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         await self._write(
             build_pipe_write_start_command(
                 compressed, self._max_queue_size, self._blocks_per_ack, req_frame, total_size
-            )
+            ),
+            response=True,
         )
         try:
             resp = await self._read(TIMEOUT_PIPE_START)
@@ -2228,7 +2248,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
                 req_frame,
                 total_size,
                 partial=partial,
-            )
+            ),
+            response=True,
         )
         try:
             resp = await self._read(TIMEOUT_PIPE_START)

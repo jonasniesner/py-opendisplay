@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -24,6 +25,19 @@ _LOGGER = logging.getLogger(__name__)
 # genuinely broken link drops instead of looping.
 MAX_CACHE_RETRIES = 2
 
+# Post-notify settle before the first command (matches the web toolbox's 300 ms
+# "encryption to stabilize" pause). Gives ESP32 time to enable CCCD subscription
+# and start draining its command/response queues.
+POST_NOTIFY_SETTLE_S = 0.3
+
+# Retry start_notify on transient GATT/proxy errors (web toolbox: 5 x 200 ms).
+NOTIFY_SETUP_MAX_ATTEMPTS = 5
+NOTIFY_SETUP_RETRY_DELAY_S = 0.2
+
+# Poll the CCCD (0x2902) until the notify bit is set, or give up and proceed.
+NOTIFY_SUBSCRIPTION_POLL_INTERVAL_S = 0.05
+NOTIFY_SUBSCRIPTION_MAX_WAIT_S = 1.0
+
 
 class BLEConnection:
     """Manages BLE connection to OpenDisplay device.
@@ -42,6 +56,7 @@ class BLEConnection:
         timeout: float = 10.0,
         max_attempts: int = 4,
         use_services_cache: bool = True,
+        fresh_gatt: bool = False,
         disconnected_callback: Callable[[], None] | None = None,
     ):
         """Initialize BLE connection manager.
@@ -52,6 +67,10 @@ class BLEConnection:
             timeout: Connection timeout in seconds (default: 10)
             max_attempts: Maximum connection attempts for bleak-retry-connector (default: 4)
             use_services_cache: Enable GATT service caching for faster reconnections (default: True)
+            fresh_gatt: When True, skip the GATT service cache on connect (forces fresh
+                discovery). Useful for one-shot probes through Bluetooth proxies where a
+                stale per-MAC GATT table can make writes succeed locally but responses
+                never arrive. Overrides ``use_services_cache``.
             disconnected_callback: Optional callback invoked when the link drops
                 (either an unexpected disconnect or a graceful one).
         """
@@ -59,7 +78,8 @@ class BLEConnection:
         self.ble_device = ble_device
         self.timeout = timeout
         self.max_attempts = max_attempts
-        self.use_services_cache = use_services_cache
+        self.use_services_cache = False if fresh_gatt else use_services_cache
+        self.fresh_gatt = fresh_gatt
         self._disconnected_callback = disconnected_callback
 
         self._client: BleakClient | None = None
@@ -280,13 +300,80 @@ class BLEConnection:
             self._write_no_response_supported,
         )
 
-        # Start notifications
-        await self._client.start_notify(
-            self._notification_characteristic,
-            self._notification_callback,
-        )
+        await self._start_notifications_with_retry()
+        await self._wait_for_notify_subscription()
+        await asyncio.sleep(POST_NOTIFY_SETTLE_S)
 
         _LOGGER.debug("Notifications started")
+
+    async def _start_notifications_with_retry(self) -> None:
+        """Enable notifications, retrying transient GATT/proxy failures."""
+        if not self._client or not self._notification_characteristic:
+            raise BLEConnectionError("Not connected")
+
+        last_error: Exception | None = None
+        for attempt in range(NOTIFY_SETUP_MAX_ATTEMPTS):
+            try:
+                await self._client.start_notify(
+                    self._notification_characteristic,
+                    self._notification_callback,
+                )
+                if attempt > 0:
+                    _LOGGER.debug(
+                        "Notifications enabled on attempt %d/%d",
+                        attempt + 1,
+                        NOTIFY_SETUP_MAX_ATTEMPTS,
+                    )
+                return
+            except Exception as err:  # noqa: BLE001 - classify below
+                last_error = err
+                if attempt + 1 >= NOTIFY_SETUP_MAX_ATTEMPTS:
+                    break
+                _LOGGER.debug(
+                    "start_notify attempt %d/%d failed (%s); retrying",
+                    attempt + 1,
+                    NOTIFY_SETUP_MAX_ATTEMPTS,
+                    err,
+                )
+                await asyncio.sleep(NOTIFY_SETUP_RETRY_DELAY_S)
+
+        raise BLEConnectionError(f"Failed to start notifications: {last_error}") from last_error
+
+    async def _wait_for_notify_subscription(self) -> None:
+        """Poll the CCCD until notifications are enabled, when readable.
+
+        ESP32 firmware only flushes its response queue once the notify subscription
+        is active. On some stacks the CCCD write completes slightly after
+        ``start_notify`` returns; a short poll avoids sending the first command
+        into a window where responses would be queued but not delivered.
+        """
+        if not self._client or not self._notification_characteristic:
+            return
+
+        cccd = None
+        for descriptor in getattr(self._notification_characteristic, "descriptors", []) or []:
+            if "2902" in str(getattr(descriptor, "uuid", "")).lower():
+                cccd = descriptor
+                break
+        if cccd is None:
+            return
+
+        deadline = time.monotonic() + NOTIFY_SUBSCRIPTION_MAX_WAIT_S
+        while time.monotonic() < deadline:
+            try:
+                value = await self._client.read_gatt_descriptor(cccd)
+            except Exception as err:  # noqa: BLE001 - best-effort poll
+                _LOGGER.debug("CCCD read failed while waiting for notify: %s", err)
+            else:
+                if value and (value[0] & 0x0001):
+                    _LOGGER.debug("Notify subscription confirmed via CCCD")
+                    return
+            await asyncio.sleep(NOTIFY_SUBSCRIPTION_POLL_INTERVAL_S)
+
+        _LOGGER.debug(
+            "Notify subscription not confirmed within %.1fs; proceeding anyway",
+            NOTIFY_SUBSCRIPTION_MAX_WAIT_S,
+        )
 
     def _on_disconnect(self, _client: BleakClient) -> None:
         """Handle an unexpected or graceful BLE disconnect.
@@ -364,9 +451,12 @@ class BLEConnection:
         if drain_stale:
             self.drain_notifications()
 
-        # Only skip the write confirmation when the caller opts out AND the
-        # characteristic actually supports it; otherwise keep write-with-response.
-        effective_response = response or not self._write_no_response_supported
+        # Write Without Response when the caller opts out and the characteristic
+        # supports it; otherwise fall back to a Write Request (ATT confirmation).
+        if response or not self._write_no_response_supported:
+            effective_response = True
+        else:
+            effective_response = False
 
         try:
             await self._client.write_gatt_char(
