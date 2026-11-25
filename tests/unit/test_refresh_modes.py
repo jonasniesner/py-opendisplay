@@ -27,7 +27,7 @@ from opendisplay.models.lut_lint import (
     sequence_lint,
     sequence_uploads_lut,
 )
-from opendisplay.models.panel_drive import DisplayLut, LengthPrefixedPacket, lut_crc16
+from opendisplay.models.panel_drive import DisplayLut, DisplayMode, LengthPrefixedPacket, lut_crc16
 from opendisplay.panels.drive_plan import mode_band, plan_drive, record_drive
 from opendisplay.panels.drive_state import (
     DriveState,
@@ -535,3 +535,55 @@ def test_subset_refuses_bad_input_and_a_result_that_fails_the_lint() -> None:
     assert lut_lint(LutFamily.S6_800, bytes(synthetic)) is None
     with pytest.raises(ValueError, match="lint"):
         assemble_subset_s6(bytes(synthetic), {0})  # holds at slots 2 and 3 join into 8 zeros
+
+
+# ── enforced temperature windows (temp_policy SUBSTITUTE / REJECT) ───────────
+
+
+def _enforced(policy: int) -> GlobalConfig:
+    """S73 with fast6/fast7 enforced at 15-24 / 25-30 C, as panels/tools/pdlib.py now writes them."""
+    windows = {"fast6": (15, 24), "fast7": (25, 30)}
+    packets = []
+    for p in S73.length_prefixed_packets:
+        if p.packet_type == 0xAE:
+            mode = DisplayMode.from_body(p.body)
+            if mode.name in windows:
+                body = bytearray(p.body)
+                body[16:19] = bytes([windows[mode.name][0] & 0xFF, windows[mode.name][1] & 0xFF, policy])
+                p = dataclasses.replace(p, body=bytes(body))
+        packets.append(p)
+    return dataclasses.replace(S73, length_prefixed_packets=packets)
+
+
+@pytest.mark.parametrize(
+    ("temp", "steps", "substituted"),
+    [
+        (20, ["fast6"], False),
+        (24, ["fast6"], False),  # inside: hysteresis is not needed
+        (25, ["fast7"], False),  # outside fast6: the sibling, never kept by hysteresis
+        (30, ["fast7"], False),
+        (31, ["full"], True),  # outside every band: stock full
+        (10, ["full"], True),
+        (None, ["fast6"], False),  # unknown: the device checks at START
+    ],
+)
+def test_enforced_windows_pick_the_band_or_fall_back_to_stock(
+    temp: int | None, steps: list[str], substituted: bool
+) -> None:
+    config = _enforced(1)
+    assert {m.name: (m.temp_min_c, m.temp_max_c, m.temp_policy) for m in config.display_modes}["fast6"] == (15, 24, 1)
+    state = DriveState(fingerprint=drive_fingerprint(config))
+    plan = plan_drive(config, state, temp, "fast6", include_experimental=True)
+    assert _steps(plan) == steps
+    assert plan.substituted is substituted
+    if substituted:
+        assert plan.chosen == 0 and not plan.stock_full_first
+        assert any("stock full instead" in n for n in plan.notes)
+
+
+def test_an_enforced_reject_window_refuses_the_update() -> None:
+    config = _enforced(2)
+    state = DriveState(fingerprint=drive_fingerprint(config))
+    with pytest.raises(ValueError, match="refuses"):
+        plan_drive(config, state, 35, "fast7", include_experimental=True)
+    assert _steps(plan_drive(config, state, 26, "fast7", include_experimental=True)) == ["fast7"]

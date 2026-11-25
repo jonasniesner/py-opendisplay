@@ -12,7 +12,12 @@ and it keeps no budget), so the host decides, from the config's modes, the store
    ``faster_cool`` share a band and moving to ``faster_warm`` counts as a band change. A band's edge sits
    half a degree past its last whole degree (``[-40, 24]`` and ``[25, 60]`` meet at 24.5 C).
    Within ``hysteresis_c`` of an edge, or with an unknown temperature, the requested mode is
-   kept and the plan says ``near_edge``.
+   kept and the plan says ``near_edge``. An ENFORCED window (``temp_policy`` SUBSTITUTE or
+   REJECT) is the device's own rule, so hysteresis never keeps a mode past it.
+1a. **Out of window.** When the temperature is known and lies outside the chosen mode's
+   enforced window, the host does what the device would: SUBSTITUTE plans mode 0, the stock
+   full, instead (``substituted``); REJECT refuses the update. The device checks again at START
+   (a stale reading), and its ACK says which mode ran.
 2. **Stock full first** (mode 0) when the state is lost or was recorded against other drive
    packets, when the band changed since the last stock drive, or when the budget would run
    over (``budget_used + cost > budget_limit``; 0xB1 tail, 0xFF = unlimited). A mode that
@@ -40,6 +45,8 @@ from .drive_state import DriveState, drive_fingerprint
 
 STOCK_MODE: Final = 0
 TEMP_POLICY_ADVISORY: Final = 0
+TEMP_POLICY_SUBSTITUTE: Final = 1
+TEMP_POLICY_REJECT: Final = 2
 DEFAULT_HYSTERESIS_C: Final = 1.0
 _BAND_NAME: Final = re.compile(r"^(?P<stem>.*\D)(?P<band>\d)$")
 _BAND_WORD: Final = re.compile(r"^(?P<stem>.*?)(?P<band>cool|warm)$", re.IGNORECASE)
@@ -67,18 +74,24 @@ class DrivePlan:  # pylint: disable=too-many-instance-attributes
     stock_full_first: bool
     budget_after: int  # budget_used once every step has run
     notes: tuple[str, ...] = ()
+    substituted: bool = False  # the temperature is outside the mode's enforced window: stock instead
 
 
 def _has_window(mode: DisplayMode) -> bool:
     return (mode.temp_min_c, mode.temp_max_c) != (0, 0)
 
 
+def enforced(mode: DisplayMode) -> bool:
+    """Whether the device enforces the mode's window (SUBSTITUTE or REJECT)."""
+    return _has_window(mode) and mode.temp_policy in (TEMP_POLICY_SUBSTITUTE, TEMP_POLICY_REJECT)
+
+
 def mode_band(mode: DisplayMode) -> tuple[str, int] | None:
-    """``(stem, band)`` of an experimental mode with an ADVISORY window and a band marker.
+    """``(stem, band)`` of an experimental mode with a temperature window and a band marker.
 
     The band is the trailing digit, or 1 for a ``cool`` and 2 for a ``warm`` suffix.
     """
-    if not mode.experimental or not _has_window(mode) or mode.temp_policy != TEMP_POLICY_ADVISORY:
+    if not mode.experimental or not _has_window(mode):
         return None
     match = _BAND_NAME.match(mode.name)
     if match is not None:
@@ -147,8 +160,9 @@ def _pick_band(
     )
     if temp_c is None:
         return wanted, True, ["panel temperature unknown: keeping the requested band"]
-    if _contains(wanted, temp_c) or _edge_distance(wanted, temp_c) <= hysteresis_c:
-        return wanted, _edge_distance(wanted, temp_c) <= hysteresis_c, []
+    near = _edge_distance(wanted, temp_c) <= hysteresis_c
+    if _contains(wanted, temp_c) or (near and not enforced(wanted)):
+        return wanted, near, []
     for sibling in siblings:
         if _contains(sibling, temp_c):
             near = _edge_distance(sibling, temp_c) <= hysteresis_c
@@ -195,6 +209,15 @@ def plan_drive(  # pylint: disable=too-many-arguments,too-many-locals
     _check_opt_in(wanted, include_experimental, "mode")
     chosen, near_edge, notes = _pick_band(modes, wanted, temp_c, hysteresis_c)
     _check_opt_in(chosen, include_experimental, "band mode")
+    substituted = False
+    if temp_c is not None and enforced(chosen) and not _contains(chosen, temp_c):
+        window = f"{chosen.temp_min_c} to {chosen.temp_max_c} C"
+        if chosen.temp_policy == TEMP_POLICY_REJECT:
+            raise ValueError(f"{temp_c} C is outside the window of '{chosen.name}' ({window}); the display refuses it")
+        if STOCK_MODE not in modes:
+            raise ValueError(f"{temp_c} C is outside the window of '{chosen.name}' and the config has no mode 0")
+        notes = [*notes, f"{temp_c} C is outside the window of '{chosen.name}' ({window}): stock full instead"]
+        chosen, near_edge, substituted = modes[STOCK_MODE], False, True
 
     scrub: DisplayMode | None = None
     scrub_index = chosen.ext.scrub_mode if chosen.ext is not None else None
@@ -241,6 +264,7 @@ def plan_drive(  # pylint: disable=too-many-arguments,too-many-locals
         stock_full_first=stock_first,
         budget_after=budget,
         notes=tuple(notes),
+        substituted=substituted,
     )
 
 
