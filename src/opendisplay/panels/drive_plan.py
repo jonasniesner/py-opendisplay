@@ -167,6 +167,8 @@ def _pick_band(
         if _contains(sibling, temp_c):
             near = _edge_distance(sibling, temp_c) <= hysteresis_c
             return sibling, near, [f"{temp_c} C is in the band of '{sibling.name}', not '{wanted.name}'"]
+    if enforced(wanted):  # plan_drive says what happens instead
+        return wanted, True, []
     return wanted, True, [f"{temp_c} C is outside every '{band[0]}' band: keeping '{wanted.name}'"]
 
 

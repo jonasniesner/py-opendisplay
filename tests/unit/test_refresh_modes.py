@@ -578,7 +578,8 @@ def test_enforced_windows_pick_the_band_or_fall_back_to_stock(
     assert plan.substituted is substituted
     if substituted:
         assert plan.chosen == 0 and not plan.stock_full_first
-        assert any("stock full instead" in n for n in plan.notes)
+        assert [n for n in plan.notes if "C is" in n] == [n for n in plan.notes if "stock full instead" in n]
+        assert len(plan.notes) == 1
 
 
 def test_an_enforced_reject_window_refuses_the_update() -> None:
