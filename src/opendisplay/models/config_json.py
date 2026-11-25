@@ -163,7 +163,11 @@ def config_to_json(config: GlobalConfig) -> dict[str, Any]:
                 "simple_config_display_index": str(mfr.simple_config_display_index),
                 "simple_config_power_index": str(mfr.simple_config_power_index),
                 "simple_config_configured_at": str(mfr.simple_config_configured_at),
-                "reserved": "0x0",
+                # Named views over reserved[0:6] (provisional layout, presets plan 2.9).
+                "simple_config_driver_rev": str(mfr.simple_config_driver_rev),
+                "simple_config_display_rev": str(mfr.simple_config_display_rev),
+                "simple_config_power_rev": str(mfr.simple_config_power_rev),
+                "reserved": _hex_bytes(bytes(mfr.reserved[:6]).ljust(6, b"\x00")),
             },
         }
     )
@@ -567,8 +571,13 @@ def config_from_json(data: dict[str, Any]) -> GlobalConfig:
                 simple_config_display_index=_parse_int(fields.get("simple_config_display_index", "0")),
                 simple_config_power_index=_parse_int(fields.get("simple_config_power_index", "0")),
                 simple_config_configured_at=_parse_int(fields.get("simple_config_configured_at", "0")),
-                reserved=bytes(6),  # Fixed size
+                reserved=_parse_hex_bytes(fields.get("reserved", "0x0"), 6),
             )
+            # The named revisions win over the raw blob when both are given (a hand edit of the
+            # named field must not be undone by a stale "reserved").
+            for rev_field in ("simple_config_driver_rev", "simple_config_display_rev", "simple_config_power_rev"):
+                if rev_field in fields:
+                    setattr(manufacturer, rev_field, _parse_int(fields[rev_field]))
 
         elif packet_id == 4:  # 0x04 = power_option
             power = PowerOption(

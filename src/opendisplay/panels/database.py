@@ -19,9 +19,12 @@ from typing import Any, Final
 
 from ..models.ident import FirmwareTarget
 from ..models.panel_drive import (
+    LUT_MAX_BYTES,
     PACKET_TYPE_DISPLAY_CONTROLLER,
+    PACKET_TYPE_DISPLAY_LUT,
     PACKET_TYPE_DISPLAY_MODE,
     PACKET_TYPE_DISPLAY_PANEL,
+    DisplayLut,
     LengthPrefixedPacket,
 )
 
@@ -143,6 +146,23 @@ def _walk_sequence(seq: bytes) -> _Walk:  # pylint: disable=too-many-return-stat
     return _Walk(False, len(seq), steps, window, "sequence has no END")
 
 
+def _lut_problem(body: bytes) -> str | None:
+    """Why a 0xAF slot would be absent on the device (size, CRC, inflate), or ``None``."""
+    try:
+        lut = DisplayLut.from_body(body)
+    except ValueError as err:
+        return f"0xAF: {err}"
+    if len(lut.data) > LUT_MAX_BYTES:
+        return f"0xAF slot {lut.slot_id}: {len(lut.data)} B stored, at most {LUT_MAX_BYTES} B"
+    if not lut.crc_valid:
+        return f"0xAF slot {lut.slot_id}: CRC does not match the stored bytes"
+    try:
+        _ = lut.waveform
+    except ValueError as err:
+        return f"0xAF: {err}"
+    return None
+
+
 def check_drive_packets_fit(
     packets: Iterable[LengthPrefixedPacket],
     target_class: TargetClass,
@@ -153,8 +173,10 @@ def check_drive_packets_fit(
     """Problems that keep ``packets`` from running on ``target_class``; empty when they fit.
 
     A port of od-v3.js ``checkDrivePacketsFit``: each 0xAE mode sequence (steps, WINDOW/FILL)
-    and each 0xB1 sleep sequence (bytes). ``max_steps`` and ``window`` override the class table,
-    for a device whose identity states its own limits.
+    and each 0xB1 sleep sequence (bytes). Not in the JS: each 0xAF slot must be at most
+    1024 B stored, match its CRC and, when compressed, inflate to at most 1024 B.
+    ``max_steps`` and ``window`` override the class table, for a device whose identity states
+    its own limits.
     """
     base = _LIMITS[target_class]
     limits = _Limits(
@@ -171,20 +193,27 @@ def check_drive_packets_fit(
                 problems.append("0xAE body shorter than its 37-byte head")
                 continue
             seq_len = body[35] | (body[36] << 8)
-            if _MODE_HEAD + seq_len != len(body):
+            # Bytes after the sequence are the mode tail (drive_ext), which firmware 3.0 ignores.
+            if _MODE_HEAD + seq_len > len(body):
                 problems.append(f"0xAE mode {body[1]}: seq_len {seq_len} does not match the body")
                 continue
-            seq, what, cap = body[_MODE_HEAD:], f"mode {body[1]}", None  # streamed: no byte cap
+            seq, what, cap = body[_MODE_HEAD : _MODE_HEAD + seq_len], f"mode {body[1]}", None  # streamed: no byte cap
         elif packet.packet_type == PACKET_TYPE_DISPLAY_PANEL:
             if len(body) < _PANEL_HEAD:
                 problems.append("0xB1 body shorter than its 13-byte head")
                 continue
-            if _PANEL_HEAD + body[12] != len(body):
+            # Bytes after the sleep sequence are the drive tail (drive_ext), ignored by firmware 3.0.
+            if _PANEL_HEAD + body[12] > len(body):
                 problems.append(f"0xB1: sleep_seq_len {body[12]} does not match the body")
                 continue
             if not body[12]:
                 continue
-            seq, what, cap = body[_PANEL_HEAD:], "sleep sequence", limits.sleep_max
+            seq, what, cap = body[_PANEL_HEAD : _PANEL_HEAD + body[12]], "sleep sequence", limits.sleep_max
+        elif packet.packet_type == PACKET_TYPE_DISPLAY_LUT:
+            problem = _lut_problem(body)
+            if problem:
+                problems.append(problem)
+            continue
         else:
             continue
         walk = _walk_sequence(seq)
@@ -214,6 +243,11 @@ class PanelEntry:  # pylint: disable=too-many-instance-attributes
         blocked_reason: Why the entry cannot be used on this class; ``None`` when it can.
         legacy_panel_ic_type: The 2.x panel id this entry replaces, when the file names one.
         legacy_model_id: The 2.x driver model the entry was derived from, when it was.
+        rev: The entry's revision in the presets bundle (``presets-v*``); 0 when the file has none.
+        min_firmware: Lowest firmware ``(major, minor, patch)`` the entry needs; ``None`` = any.
+        changelog: The entry's changelog line for its current ``rev``, when the file has one.
+        experimental_modes: ``mode_index`` values the file flags ``experimental``.
+        experimental_note: What is unproven about the experimental modes.
     """
 
     panel_ic_type: int
@@ -230,6 +264,11 @@ class PanelEntry:  # pylint: disable=too-many-instance-attributes
     blocked_reason: str | None
     legacy_panel_ic_type: int | None = None
     legacy_model_id: int | None = None
+    rev: int = 0
+    min_firmware: tuple[int, int, int] | None = None
+    changelog: str | None = None
+    experimental_modes: frozenset[int] = frozenset()
+    experimental_note: str | None = None
 
     @property
     def usable(self) -> bool:
@@ -258,6 +297,26 @@ def _num(value: Any) -> int | None:
         return int(text, 16) if text.lower().startswith("0x") else int(text)
     except ValueError:
         return None
+
+
+def parse_min_firmware(value: Any) -> tuple[int, int, int] | None:
+    """``"3.1"`` / ``"3.1.2"`` / ``"v3.1"`` -> ``(3, 1, 0)`` / ``(3, 1, 2)``; ``None`` when absent or unreadable."""
+    if value is None:
+        return None
+    match = re.fullmatch(r"v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(value).strip())
+    if match is None:
+        return None
+    major, minor, patch = (int(part) if part else 0 for part in match.groups())
+    return major, minor, patch
+
+
+def _experimental_modes(src: Mapping[str, Any]) -> frozenset[int]:
+    out = set()
+    for mode in src.get("modes") or []:
+        index = _num(mode.get("index")) if isinstance(mode, Mapping) else None
+        if index is not None and mode.get("experimental") is True:
+            out.add(index)
+    return frozenset(out)
 
 
 def _normalize_verified(value: Any) -> str:
@@ -338,6 +397,12 @@ def _drive_view(meta: Mapping[str, Any], src: Mapping[str, Any], target_class: T
         blocked_reason=None if usable else reason,
         legacy_panel_ic_type=meta["legacy_panel_ic_type"],
         legacy_model_id=meta["legacy_model_id"],
+        # A per-class view may carry its own rev; else the panel's (presets plan 2.9: rev per entry).
+        rev=_num(src.get("rev", meta.get("rev"))) or 0,
+        min_firmware=parse_min_firmware(src.get("min_firmware", meta.get("min_firmware"))),
+        changelog=src.get("changelog", meta.get("changelog")),
+        experimental_modes=_experimental_modes(src) or _experimental_modes(meta.get("_modes_src") or {}),
+        experimental_note=src.get("experimental_note", meta.get("experimental_note")),
     )
 
 
@@ -367,6 +432,11 @@ def _panel_from_generated(key: str, entry: Mapping[str, Any], panels: Mapping[st
         "color_scheme": _num(entry.get("color_scheme")),
         "legacy_panel_ic_type": _num(legacy.get("panel_ic_type")),
         "legacy_model_id": _num(legacy.get("model_id")),
+        "rev": src.get("rev"),
+        "min_firmware": src.get("min_firmware"),
+        "changelog": src.get("changelog"),
+        "experimental_note": src.get("experimental_note"),
+        "_modes_src": {"modes": src.get("modes") or []},
     }
     classes: dict[TargetClass, PanelEntry] = {}
     for name, view in (src.get("targets") or {}).items():

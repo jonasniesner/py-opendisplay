@@ -185,6 +185,48 @@ class ManufacturerData:
         """Get human-readable board type name for this manufacturer, if known."""
         return get_board_type_name(self.manufacturer_id, self.board_type)
 
+    # The 6 bytes after configured_at hold the revisions of the three simple-config presets that
+    # were applied (u16 LE each, 0 = unknown). PROVISIONAL: decided 2026-11-25 (presets plan 2.9),
+    # not yet in opendisplay_structs.h. ``reserved`` stays the single source of truth so the raw
+    # bytes round-trip unchanged; these properties are views over it.
+    def _rev(self, index: int) -> int:
+        raw = bytes(self.reserved[:6]).ljust(6, b"\x00")
+        return int.from_bytes(raw[2 * index : 2 * index + 2], "little")
+
+    def _set_rev(self, index: int, value: int) -> None:
+        if not 0 <= value <= 0xFFFF:
+            raise ValueError(f"simple-config revision out of range (u16): {value}")
+        raw = bytearray(bytes(self.reserved[:6]).ljust(6, b"\x00"))
+        raw[2 * index : 2 * index + 2] = value.to_bytes(2, "little")
+        self.reserved = bytes(raw)
+
+    @property
+    def simple_config_driver_rev(self) -> int:
+        """Revision of the driver-board preset that was applied (0 = unknown)."""
+        return self._rev(0)
+
+    @simple_config_driver_rev.setter
+    def simple_config_driver_rev(self, value: int) -> None:
+        self._set_rev(0, value)
+
+    @property
+    def simple_config_display_rev(self) -> int:
+        """Revision of the display preset that was applied (0 = unknown)."""
+        return self._rev(1)
+
+    @simple_config_display_rev.setter
+    def simple_config_display_rev(self, value: int) -> None:
+        self._set_rev(1, value)
+
+    @property
+    def simple_config_power_rev(self) -> int:
+        """Revision of the power preset that was applied (0 = unknown)."""
+        return self._rev(2)
+
+    @simple_config_power_rev.setter
+    def simple_config_power_rev(self, value: int) -> None:
+        self._set_rev(2, value)
+
     SIZE: ClassVar[int] = 22
 
     @classmethod

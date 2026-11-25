@@ -28,9 +28,11 @@ library keeps raw (see ``GlobalConfig.action_table`` and ``GlobalConfig.display_
 from __future__ import annotations
 
 import struct
+import zlib
 from dataclasses import dataclass
 from typing import ClassVar, Self
 
+from .drive_ext import DriveExt, ModeExt
 from .enums import ColorScheme
 
 PACKET_TYPE_DISPLAY_MODE = 0xAE
@@ -50,6 +52,17 @@ COLOR_SCHEME_INHERIT = 0xFF
 LUT_SLOT_NONE = 0xFF
 
 MAX_PASSES = 8
+
+#: ``display_lut.lut_slot`` bit 7: the slot's data is raw-deflate compressed (PROVISIONAL, presets
+#: plan 5.3 F1). Firmware 3.0 sees an id no mode references and treats the slot as absent.
+LUT_SLOT_COMPRESSED = 0x80
+#: Bits 0-3 of ``lut_slot``: the slot id a mode references (16 slots).
+LUT_SLOT_ID_MASK = 0x0F
+#: Largest waveform a slot holds, inflated, and largest stored (compressed) slot.
+LUT_MAX_BYTES = 1024
+MAX_LUT_SLOTS = 16
+#: Raw deflate, 10-bit window (1 KB): no gain above it for these tables (presets plan 5.3 F1).
+LUT_DEFLATE_WBITS = -10
 
 
 @dataclass(frozen=True)
@@ -102,8 +115,20 @@ class DisplayMode:
     lut_slots: tuple[int, ...]  # waveform slot per pass; LUT_SLOT_NONE = none
     vsn1: tuple[int, ...]  # per-pass waveform byte-3 patch value; 0 = none
     sequence: bytes  # encoded drive sequence, executed by the firmware
+    tail: bytes = b""  # bytes after the sequence, verbatim (firmware 3.0 ignores them)
 
     _HEAD: ClassVar[struct.Struct] = struct.Struct("<BB12sBBbbB8s8sH")
+
+    @property
+    def ext(self) -> ModeExt | None:
+        """The parsed mode tail (provisional layout), or ``None`` when there is none."""
+        return ModeExt.from_tail(self.tail)
+
+    @property
+    def experimental(self) -> bool:
+        """Whether the mode is flagged experimental; never pick it by default."""
+        ext = self.ext
+        return ext is not None and ext.experimental
 
     @property
     def color_scheme_enum(self) -> ColorScheme | int | None:
@@ -138,6 +163,7 @@ class DisplayMode:
             lut_slots=tuple(slots[:used]),
             vsn1=tuple(vsn1[:used]),
             sequence=body[cls._HEAD.size : cls._HEAD.size + seq_len],
+            tail=body[cls._HEAD.size + seq_len :],
         )
 
 
@@ -146,9 +172,9 @@ class DisplayLut:
     """One waveform slot (packet 0xAF)."""
 
     instance_number: int
-    lut_slot: int  # id referenced by DisplayMode.lut_slots
-    crc16: int  # CRC-16/CCITT-FALSE over ``data``
-    data: bytes  # the waveform, at the size the panel's register holds
+    lut_slot: int  # stored byte: bit 7 = compressed, bits 0-3 = the id DisplayMode.lut_slots names
+    crc16: int  # CRC-16/CCITT-FALSE over ``data``, the stored (possibly compressed) bytes
+    data: bytes  # the stored bytes: the waveform, or its raw-deflate stream when compressed
 
     _HEAD: ClassVar[struct.Struct] = struct.Struct("<BBH")
 
@@ -156,6 +182,65 @@ class DisplayLut:
     def crc_valid(self) -> bool:
         """Whether ``data`` matches its CRC. Firmware treats a failing slot as absent."""
         return _crc16_ccitt_false(self.data) == self.crc16
+
+    @property
+    def compressed(self) -> bool:
+        """Whether ``data`` is a raw-deflate stream (``lut_slot`` bit 7)."""
+        return bool(self.lut_slot & LUT_SLOT_COMPRESSED)
+
+    @property
+    def slot_id(self) -> int:
+        """The id a mode references this slot by (bits 0-3 of ``lut_slot``)."""
+        return self.lut_slot & LUT_SLOT_ID_MASK
+
+    @property
+    def waveform(self) -> bytes:
+        """The waveform the panel receives: ``data`` inflated when the slot is compressed.
+
+        Raises:
+            ValueError: The stream does not inflate, is truncated, or inflates past
+                :data:`LUT_MAX_BYTES` (the firmware treats such a slot as absent).
+        """
+        if not self.compressed:
+            return self.data
+        inflater = zlib.decompressobj(LUT_DEFLATE_WBITS)
+        try:
+            out = inflater.decompress(self.data, LUT_MAX_BYTES + 1)
+        except zlib.error as err:
+            raise ValueError(f"LUT slot {self.slot_id}: deflate stream does not inflate: {err}") from err
+        if len(out) > LUT_MAX_BYTES:
+            raise ValueError(f"LUT slot {self.slot_id}: inflates past {LUT_MAX_BYTES} bytes")
+        if not inflater.eof:
+            raise ValueError(f"LUT slot {self.slot_id}: deflate stream is truncated")
+        return out
+
+    def to_body(self) -> bytes:
+        """Serialise the packet body."""
+        return self._HEAD.pack(self.instance_number, self.lut_slot, self.crc16) + self.data
+
+    @classmethod
+    def build(cls, instance_number: int, slot_id: int, waveform: bytes, *, compress: bool | None = None) -> Self:
+        """A slot for ``waveform``; ``compress=None`` compresses only when that is smaller.
+
+        The CRC covers the stored bytes (compressed when compressed), as the firmware checks it
+        at config load before inflating.
+
+        Raises:
+            ValueError: ``slot_id`` is not 0-15, or the waveform or stored data exceeds
+                :data:`LUT_MAX_BYTES`.
+        """
+        if not 0 <= slot_id < MAX_LUT_SLOTS:
+            raise ValueError(f"LUT slot id must be 0-{MAX_LUT_SLOTS - 1}, got {slot_id}")
+        if len(waveform) > LUT_MAX_BYTES:
+            raise ValueError(f"waveform is {len(waveform)} bytes, a slot holds at most {LUT_MAX_BYTES}")
+        deflater = zlib.compressobj(9, zlib.DEFLATED, LUT_DEFLATE_WBITS)
+        packed = deflater.compress(waveform) + deflater.flush()
+        use = compress if compress is not None else len(packed) < len(waveform)
+        data = packed if use else waveform
+        if len(data) > LUT_MAX_BYTES:
+            raise ValueError(f"stored LUT slot is {len(data)} bytes, at most {LUT_MAX_BYTES}")
+        slot = slot_id | (LUT_SLOT_COMPRESSED if use else 0)
+        return cls(instance_number=instance_number, lut_slot=slot, crc16=_crc16_ccitt_false(data), data=data)
 
     @classmethod
     def from_body(cls, body: bytes) -> Self:
@@ -167,6 +252,11 @@ class DisplayLut:
         _require(body, cls._HEAD.size, "display_lut")
         instance, slot, crc16 = cls._HEAD.unpack_from(body)
         return cls(instance_number=instance, lut_slot=slot, crc16=crc16, data=body[cls._HEAD.size :])
+
+
+def find_lut(luts: list[DisplayLut] | tuple[DisplayLut, ...], instance_number: int, slot_id: int) -> DisplayLut | None:
+    """The slot a mode names by ``slot_id`` (plain or compressed); the first match wins."""
+    return next((lut for lut in luts if lut.instance_number == instance_number and lut.slot_id == slot_id), None)
 
 
 @dataclass(frozen=True)
@@ -236,6 +326,12 @@ class DisplayPanel:
     code_map: tuple[int, int, int, int]  # logical colour index -> panel 2-bit code (4-colour path)
     mode_count: int  # how many display_mode packets belong to this display
     sleep_sequence: bytes  # encoded sleep sequence, executed by the firmware
+    tail: bytes = b""  # bytes after the sleep sequence, verbatim (firmware 3.0 ignores them)
+
+    @property
+    def ext(self) -> DriveExt | None:
+        """The parsed drive tail (provisional layout), or ``None`` when there is none."""
+        return DriveExt.from_tail(self.tail)
 
     _HEAD: ClassVar[struct.Struct] = struct.Struct("<BBBHH4sBB")
     _FLAG_BUSY_USABLE: ClassVar[int] = 0x01
@@ -270,4 +366,5 @@ class DisplayPanel:
             code_map=(code_map[0], code_map[1], code_map[2], code_map[3]),
             mode_count=mode_count,
             sleep_sequence=body[cls._HEAD.size : cls._HEAD.size + sleep_len],
+            tail=body[cls._HEAD.size + sleep_len :],
         )

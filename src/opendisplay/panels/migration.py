@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from ..models.config import DisplayConfig, GlobalConfig
+from ..models.drive_ext import DRIVE_FLAG_HAND_EDITED, DriveExt, ModeExt, mode_tail_offset, with_drive_tail
 from ..models.ident import FirmwareTarget
 from ..models.panel_drive import (
     PACKET_TYPE_DISPLAY_CALIBRATION,
@@ -73,6 +74,10 @@ class MigrationPlan:  # pylint: disable=too-many-instance-attributes
             2.x sent, but nobody has watched this panel draw with it.
         remap_panel_ic_type: The id that replaces the display's ``panel_ic_type`` in 0x20, when
             it changes (a Firmware_NRF 2.x id, or a panel the caller named).
+        kept: Drive packets that stay although the rest of the drive data is replaced: 0xB0
+            palettes measured on this unit (``cal_flags`` bit 0), when the panel stays the same.
+        skipped_experimental: ``mode_index`` values of experimental modes left out of ``add``
+            because the caller did not opt in.
     """
 
     needed: bool
@@ -85,6 +90,8 @@ class MigrationPlan:  # pylint: disable=too-many-instance-attributes
     remove: tuple[LengthPrefixedPacket, ...] = ()
     needs_confirmation: bool = False
     remap_panel_ic_type: int | None = None
+    kept: tuple[LengthPrefixedPacket, ...] = ()
+    skipped_experimental: tuple[int, ...] = ()
 
 
 def _limits(profile: DeviceProfile) -> tuple[int | None, bool | None]:
@@ -171,12 +178,148 @@ def _plan_native(
     )
 
 
+# ── preset packets: measured palettes, experimental modes, the drive tail ────
+
+_CAL_FLAG_MEASURED: Final = 0x01
+_PANEL_MODE_COUNT_OFFSET: Final = 11
+
+
+def measured_calibrations(packets: Sequence[LengthPrefixedPacket]) -> tuple[LengthPrefixedPacket, ...]:
+    """The 0xB0 packets measured on this unit (``cal_flags`` bit 0): never replaced by a preset."""
+    return tuple(
+        p
+        for p in packets
+        if p.packet_type == PACKET_TYPE_DISPLAY_CALIBRATION and len(p.body) >= 3 and p.body[2] & _CAL_FLAG_MEASURED
+    )
+
+
+def _mode_is_experimental(body: bytes) -> bool:
+    try:
+        ext = ModeExt.from_tail(body[mode_tail_offset(body) :])
+    except ValueError:
+        return False
+    return ext is not None and ext.experimental
+
+
+def experimental_mode_indexes(
+    packets: Sequence[LengthPrefixedPacket], flagged: frozenset[int] = frozenset()
+) -> frozenset[int]:
+    """``mode_index`` of every experimental mode: flagged in the bundle (``flagged``) or in its 0xAE tail."""
+    out = set(flagged)
+    for p in packets:
+        if p.packet_type == PACKET_TYPE_DISPLAY_MODE and len(p.body) >= 2 and _mode_is_experimental(p.body):
+            out.add(p.body[1])
+    return frozenset(out)
+
+
+def strip_modes(packets: Sequence[LengthPrefixedPacket], drop: frozenset[int]) -> tuple[LengthPrefixedPacket, ...]:
+    """``packets`` without the 0xAE modes ``drop``, their 0xB0 palettes and the 0xAF slots only they use.
+
+    Each 0xB1 ``mode_count`` is set to the modes its display keeps.
+
+    Raises:
+        ValueError: Mode 0 (the default mode every plain upload uses) would be dropped.
+    """
+    if not drop:
+        return tuple(packets)
+    if 0 in drop:
+        raise ValueError("mode 0 is flagged experimental; the default mode must not be experimental")
+    modes = [p for p in packets if p.packet_type == PACKET_TYPE_DISPLAY_MODE and len(p.body) >= 35]
+    kept_modes = [p for p in modes if p.body[1] not in drop]
+    used_slots = {(p.body[0], slot) for p in kept_modes for slot in p.body[19:27]}
+    dropped_slots = {(p.body[0], slot) for p in modes if p.body[1] in drop for slot in p.body[19:27]}
+    count = Counter(p.body[0] for p in kept_modes)
+    out = []
+    for p in packets:
+        body = p.body
+        if p.packet_type in (PACKET_TYPE_DISPLAY_MODE, PACKET_TYPE_DISPLAY_CALIBRATION) and body[1:2]:
+            if body[1] in drop:
+                continue
+        if p.packet_type == PACKET_TYPE_DISPLAY_LUT and len(body) >= 2:
+            slot = (body[0], body[1] & 0x0F)
+            if slot in dropped_slots and slot not in used_slots:
+                continue
+        if p.packet_type == PACKET_TYPE_DISPLAY_PANEL and len(body) > _PANEL_MODE_COUNT_OFFSET:
+            patched = bytearray(body)
+            patched[_PANEL_MODE_COUNT_OFFSET] = count[body[0]]
+            p = dataclasses.replace(p, body=bytes(patched))
+        out.append(p)
+    return tuple(out)
+
+
+def stamp_drive_preset(
+    packets: Sequence[LengthPrefixedPacket], drive_preset_key: int, drive_rev: int
+) -> tuple[LengthPrefixedPacket, ...]:
+    """``packets`` with every 0xB1 drive tail naming the preset they came from (presets plan 2.9).
+
+    Fields the preset's own tail sets (budget limit, LUT family, BUSY seconds) are kept; the
+    hand-edited flag is cleared, since these are the preset's bytes.
+    """
+    out = []
+    for p in packets:
+        if p.packet_type == PACKET_TYPE_DISPLAY_PANEL:
+            current = _drive_ext(p.body) or DriveExt()
+            ext = dataclasses.replace(
+                current,
+                drive_preset_key=drive_preset_key,
+                drive_rev=drive_rev,
+                drive_flags=current.drive_flags & ~DRIVE_FLAG_HAND_EDITED,
+            )
+            p = dataclasses.replace(p, body=with_drive_tail(p.body, ext))
+        out.append(p)
+    return tuple(out)
+
+
+def _drive_ext(body: bytes) -> DriveExt | None:
+    if len(body) < 13 or len(body) < 13 + body[12]:
+        return None
+    return DriveExt.from_tail(body[13 + body[12] :])
+
+
+def drive_ext_of(config: GlobalConfig, instance_number: int = 0) -> DriveExt | None:
+    """The drive tail of a display's first 0xB1, or ``None`` when it has none."""
+    for p in config.length_prefixed_packets:
+        if p.packet_type == PACKET_TYPE_DISPLAY_PANEL and p.body[:1] == bytes([instance_number]):
+            return _drive_ext(p.body)
+    return None
+
+
+def preset_packets(
+    entry: PanelEntry,
+    *,
+    include_experimental: bool,
+    keep: Sequence[LengthPrefixedPacket] = (),
+) -> tuple[tuple[LengthPrefixedPacket, ...], tuple[int, ...]]:
+    """The packets to write from ``entry`` and the experimental modes left out.
+
+    Without ``include_experimental`` the experimental modes are left out. A 0xB0 the preset has
+    for a mode whose measured palette is kept (``keep``) is left out too. With a ``rev``, the 0xB1
+    drive tail names the entry.
+
+    Raises:
+        ValueError: The entry flags mode 0 experimental.
+    """
+    experimental = experimental_mode_indexes(entry.packets, entry.experimental_modes)
+    drop = frozenset() if include_experimental else experimental
+    packets = strip_modes(entry.packets, drop)
+    covered = {(p.body[0], p.body[1]) for p in keep if len(p.body) >= 2}
+    packets = tuple(
+        p
+        for p in packets
+        if not (p.packet_type == PACKET_TYPE_DISPLAY_CALIBRATION and (p.body[0], p.body[1]) in covered)
+    )
+    if entry.rev:
+        packets = stamp_drive_preset(packets, entry.panel_ic_type, entry.rev)
+    return packets, tuple(sorted(drop))
+
+
 def plan_migration(
     config: GlobalConfig | None,
     profile: DeviceProfile,
     db: PanelDatabase,
     *,
     panel_ic_type: int | None = None,
+    include_experimental: bool = False,
 ) -> MigrationPlan:
     """Decide what a config needs before a firmware 3.0 device can draw (od-v3.js ``planMigration``).
 
@@ -185,8 +328,9 @@ def plan_migration(
         profile: The device's profile; its target picks the class, its identity the limits.
         db: The panel database.
         panel_ic_type: The panel to migrate to, overriding the config's.
+        include_experimental: Also write the entry's experimental modes (opt-in).
     """
-    plan = _plan(config, profile, db, panel_ic_type)
+    plan = _plan(config, profile, db, panel_ic_type, include_experimental)
     if plan.blocked and profile.target is None:
         return dataclasses.replace(plan, reason=plan.reason + UNKNOWN_TARGET_NOTE)
     return plan
@@ -197,6 +341,7 @@ def _plan(  # pylint: disable=too-many-return-statements
     profile: DeviceProfile,
     db: PanelDatabase,
     panel_ic_type: int | None,
+    include_experimental: bool = False,
 ) -> MigrationPlan:
     target_class = target_class_for(profile.target)
     plan = MigrationPlan(needed=False, blocked=False, reason="", panel_ic_type=None, target_class=target_class)
@@ -249,12 +394,20 @@ def _plan(  # pylint: disable=too-many-return-statements
         reason = "stored drive packets do not run on this target (" + "; ".join(present_problems) + ")"
     else:
         reason = "device asked for migration"
+    # A palette measured on this unit outlives the drive data, as long as the panel stays the same.
+    keep = measured_calibrations(present) if remap is None else ()
+    try:
+        add, skipped = preset_packets(entry, include_experimental=include_experimental, keep=keep)
+    except ValueError as err:
+        return dataclasses.replace(plan, blocked=True, entry=entry, reason=f"panel {panel:#06x}'s preset: {err}")
     plan = dataclasses.replace(
         plan,
         entry=entry,
         reason=reason,
-        remove=present,
-        add=entry.packets,
+        remove=tuple(p for p in present if p not in keep),
+        add=add,
+        kept=keep,
+        skipped_experimental=skipped,
         needs_confirmation=entry.verified != "glass",
     )
     problems = check_fits(_apply(config, plan), profile, caps=db.caps)

@@ -57,12 +57,14 @@ class ProfileMode:
         color_scheme: The raw scheme value the mode renders, or ``None`` when it inherits the
             display's (0x20) scheme. Mode-level schemes such as BWRY16 (10) live only here.
         passes: Frames one transfer in this mode streams.
+        experimental: The 0xAE mode tail flags it experimental: label it, never pick it by default.
     """
 
     mode_index: int
     name: str
     color_scheme: int | None
     passes: int
+    experimental: bool = False
 
 
 @dataclass(frozen=True)
@@ -156,7 +158,7 @@ def _drive_modes(config: GlobalConfig | None, display: DisplayConfig | None) -> 
         if mode.instance_number != display.instance_number or mode.mode_index in first:
             continue
         scheme = None if mode.color_scheme == COLOR_SCHEME_INHERIT else mode.color_scheme
-        first[mode.mode_index] = ProfileMode(mode.mode_index, mode.name, scheme, mode.passes)
+        first[mode.mode_index] = ProfileMode(mode.mode_index, mode.name, scheme, mode.passes, mode.experimental)
     return tuple(first[index] for index in sorted(first))
 
 
