@@ -390,6 +390,18 @@ def test_bands_are_families_with_a_window_and_a_digit() -> None:
     assert mode_band(next(m for m in ee02.display_modes if m.name == "fast")) is None
 
 
+def test_cool_and_warm_suffixes_are_bands_1_and_2() -> None:
+    """The readable names (faster_cool / faster_warm, partialcool) band like the digit names."""
+    renamed = {"fast6": "faster_cool", "fast7": "faster_warm", "partial6": "partialcool", "pll08": "full_quick"}
+    modes = {
+        renamed.get(m.name, m.name): dataclasses.replace(m, name=renamed.get(m.name, m.name)) for m in S73.display_modes
+    }
+    assert mode_band(modes["faster_cool"]) == ("faster_", 1)
+    assert mode_band(modes["faster_warm"]) == ("faster_", 2)
+    assert mode_band(modes["partialcool"]) == ("partial", 1)
+    assert mode_band(modes["full_quick"]) is None
+
+
 @pytest.mark.parametrize(
     ("temp", "chosen", "near"),
     [

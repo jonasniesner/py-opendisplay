@@ -5,9 +5,11 @@ and it keeps no budget), so the host decides, from the config's modes, the store
 :class:`~opendisplay.panels.drive_state.DriveState` and the latest panel temperature (the
 0x0085 ACK's ``temp_c``):
 
-1. **Band pick.** Experimental modes that share a stem and differ only by a trailing band digit
-   (``fast6`` / ``fast7``, ``replica6`` / ``replica7``), each with an ADVISORY temperature
-   window, are one family; the one whose window holds ``temp_c`` is driven. A band's edge sits
+1. **Band pick.** Experimental modes that share a stem and differ only by a trailing band marker
+   (a digit: ``fast6`` / ``fast7``; or ``cool`` / ``warm``: ``faster_cool`` / ``faster_warm``),
+   each with an ADVISORY temperature window, are one family; the one whose window holds
+   ``temp_c`` is driven. ``cool`` is band 1 and ``warm`` band 2, so ``partialcool`` and
+   ``faster_cool`` share a band and moving to ``faster_warm`` counts as a band change. A band's edge sits
    half a degree past its last whole degree (``[-40, 24]`` and ``[25, 60]`` meet at 24.5 C).
    Within ``hysteresis_c`` of an edge, or with an unknown temperature, the requested mode is
    kept and the plan says ``near_edge``.
@@ -40,6 +42,8 @@ STOCK_MODE: Final = 0
 TEMP_POLICY_ADVISORY: Final = 0
 DEFAULT_HYSTERESIS_C: Final = 1.0
 _BAND_NAME: Final = re.compile(r"^(?P<stem>.*\D)(?P<band>\d)$")
+_BAND_WORD: Final = re.compile(r"^(?P<stem>.*?)(?P<band>cool|warm)$", re.IGNORECASE)
+_BAND_WORDS: Final = {"cool": 1, "warm": 2}
 
 
 @dataclass(frozen=True)
@@ -70,11 +74,19 @@ def _has_window(mode: DisplayMode) -> bool:
 
 
 def mode_band(mode: DisplayMode) -> tuple[str, int] | None:
-    """``(stem, band digit)`` of an experimental mode with an ADVISORY window and a band digit."""
-    match = _BAND_NAME.match(mode.name)
-    if match is None or not mode.experimental or not _has_window(mode) or mode.temp_policy != TEMP_POLICY_ADVISORY:
+    """``(stem, band)`` of an experimental mode with an ADVISORY window and a band marker.
+
+    The band is the trailing digit, or 1 for a ``cool`` and 2 for a ``warm`` suffix.
+    """
+    if not mode.experimental or not _has_window(mode) or mode.temp_policy != TEMP_POLICY_ADVISORY:
         return None
-    return match["stem"].lower(), int(match["band"])
+    match = _BAND_NAME.match(mode.name)
+    if match is not None:
+        return match["stem"].lower(), int(match["band"])
+    word = _BAND_WORD.match(mode.name)
+    if word is not None:
+        return word["stem"].lower(), _BAND_WORDS[word["band"].lower()]
+    return None
 
 
 def mode_cost(mode: DisplayMode) -> tuple[int, bool]:
