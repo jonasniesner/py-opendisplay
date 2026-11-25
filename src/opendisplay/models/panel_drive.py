@@ -95,6 +95,11 @@ def _crc16_ccitt_false(data: bytes) -> int:
     return crc
 
 
+def lut_crc16(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE as 0xAF slots and INLINE_LUT tables carry it."""
+    return _crc16_ccitt_false(data)
+
+
 def _require(body: bytes, size: int, name: str) -> None:
     if len(body) < size:
         raise ValueError(f"{name} body too short: {len(body)} bytes (need at least {size})")

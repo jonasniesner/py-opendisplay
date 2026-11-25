@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
 
 from ..models.buzzer_activate import BuzzerActivateConfig
 from ..models.led_flash import LedFlashConfig
+from ..models.lut_lint import lut_lint
+from ..models.panel_drive import LUT_MAX_BYTES, MAX_LUT_SLOTS, lut_crc16
 
 
 class CommandCode(IntEnum):
@@ -273,28 +276,77 @@ def build_direct_write_start_compressed(
 
 DRIVE_WRITE_FLAG_COMPRESSED = 0x01  # payload carries uncompressed_size + zlib stream
 # DRIVE_WRITE_FLAG_PIPELINED (0x02) is never set: Firmware target only, and data goes over 0x71.
+#: The two reserved bytes are ``inline_len`` and the stream starts with that many bytes of
+#: inline tables (provisional, Firmware_Unified fw-refresh-modes docs/REFRESH_MODES.md).
+DRIVE_WRITE_FLAG_INLINE_LUT = 0x04
+INLINE_LUT_HEADER = 5  # [slot_id:1][len:2 LE][crc16:2 LE]
 
 
 def build_drive_write_start(
-    mode: int, refresh: int, *, uncompressed_size: int | None = None, first_chunk: bytes = b""
+    mode: int,
+    refresh: int,
+    *,
+    uncompressed_size: int | None = None,
+    first_chunk: bytes = b"",
+    inline_len: int = 0,
 ) -> bytes:
     """Build CMD_DRIVE_WRITE_START (0x0085): a full-frame write in a config-declared drive mode.
 
     Format: ``[00][85][mode][refresh][flags][rsv:2]``, then, when compressed,
-    ``[uncompressed_size:4 LE]`` and the first bytes of the zlib stream.
+    ``[uncompressed_size:4 LE]`` and the first bytes of the zlib stream. With ``inline_len``
+    the flags carry INLINE_LUT (0x04) and ``rsv`` is ``inline_len`` (u16 LE); the stream then
+    starts with that many bytes of inline tables (:func:`build_inline_lut_prefix`), and a
+    compressed stream's ``uncompressed_size`` counts them.
 
     Args:
         mode: The mode's ``mode_index``.
         refresh: The refresh byte (``RefreshMode`` value).
-        uncompressed_size: The frames' total uncompressed size; ``None`` for an uncompressed write.
+        uncompressed_size: The stream's total uncompressed size; ``None`` for an uncompressed write.
         first_chunk: The first compressed bytes (compressed writes only).
+        inline_len: Bytes of inline tables at the start of the stream; 0 = none.
+
+    Raises:
+        ValueError: ``first_chunk`` without ``uncompressed_size``, or ``inline_len`` not a u16.
     """
+    if not 0 <= inline_len <= 0xFFFF:
+        raise ValueError(f"inline_len must fit a u16, got {inline_len}")
+    flags = DRIVE_WRITE_FLAG_INLINE_LUT if inline_len else 0
+    reserved = inline_len.to_bytes(2, "little")
     if uncompressed_size is None:
         if first_chunk:
             raise ValueError("first_chunk needs uncompressed_size: inline data is only sent compressed")
-        return bytes([0x00, 0x85, mode, refresh, 0x00, 0x00, 0x00])
-    head = bytes([0x00, 0x85, mode, refresh, DRIVE_WRITE_FLAG_COMPRESSED, 0x00, 0x00])
+        return bytes([0x00, 0x85, mode, refresh, flags]) + reserved
+    head = bytes([0x00, 0x85, mode, refresh, flags | DRIVE_WRITE_FLAG_COMPRESSED]) + reserved
     return head + uncompressed_size.to_bytes(4, "little") + first_chunk
+
+
+def build_inline_lut_prefix(tables: Mapping[int, bytes], *, lut_family: int = 0) -> bytes:
+    """The INLINE_LUT prefix: ``[slot_id][len:2 LE][crc16:2 LE][table]`` per table, by slot order.
+
+    Tables are raw (not deflated; the stream has its own zlib option). They shadow the stored
+    0xAF slots for this one transfer. Checked as the device checks them (``inline_feed``):
+    slot 0-15, unique (a mapping cannot repeat a key), 1-1024 bytes, and the ``lut_family``
+    lint.
+
+    Raises:
+        ValueError: No tables, or a table the device would refuse (nothing is sent).
+    """
+    if not tables:
+        raise ValueError("INLINE_LUT needs at least one table")
+    out = bytearray()
+    for slot in sorted(tables):
+        table = bytes(tables[slot])
+        if not 0 <= slot < MAX_LUT_SLOTS:
+            raise ValueError(f"inline LUT slot must be 0-{MAX_LUT_SLOTS - 1}, got {slot}")
+        if not 1 <= len(table) <= LUT_MAX_BYTES:
+            raise ValueError(f"inline LUT slot {slot} is {len(table)} bytes; 1-{LUT_MAX_BYTES} allowed")
+        problem = lut_lint(lut_family, table)
+        if problem is not None:
+            raise ValueError(f"inline LUT slot {slot} fails the device lint: {problem}")
+        out += bytes([slot]) + len(table).to_bytes(2, "little") + lut_crc16(table).to_bytes(2, "little") + table
+    if len(out) > 0xFFFF:
+        raise ValueError(f"inline LUT prefix is {len(out)} bytes; inline_len is a u16")
+    return bytes(out)
 
 
 def build_direct_write_start_uncompressed() -> bytes:

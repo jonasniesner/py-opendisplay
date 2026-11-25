@@ -9,16 +9,18 @@ design note (``2026-11-16-v3-3b-drive-modes-design.md``, the website's rule).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Final
 
 from ..exceptions import DriveModeSubstitutedError, DriveModeTemperatureError, InvalidResponseError
 from ..models.enums import RefreshMode
-from ..models.panel_drive import DisplayMode
+from ..models.lut_lint import mode_problem
+from ..models.panel_drive import DisplayLut, DisplayMode
 from ..protocol import CommandCode, validate_ack_response
 from ..protocol.commands import (
     build_direct_write_end_command,
     build_drive_write_start,
+    build_inline_lut_prefix,
 )
 from ..protocol.responses import parse_drive_write_start
 from .channel import SecureChannel
@@ -48,7 +50,30 @@ def end_timeout(passes: int) -> float:
     return max(_MIN_ACK_S, passes * _PASS_REFRESH_S)
 
 
-async def drive_write(  # pylint: disable=too-many-arguments
+def drive_prefix(
+    mode: DisplayMode,
+    *,
+    inline_luts: Mapping[int, bytes] | None = None,
+    lut_family: int = 0,
+    stored_luts: Sequence[DisplayLut] = (),
+) -> bytes:
+    """Check ``mode`` the way the device will at START and build its INLINE_LUT prefix (or ``b""``).
+
+    The checks (:func:`~opendisplay.models.lut_lint.mode_problem`, and the inline tables' own
+    lint in :func:`~opendisplay.protocol.commands.build_inline_lut_prefix`) refuse what a device
+    with this ``lut_family`` would refuse, before any I/O.
+
+    Raises:
+        ValueError: The device would refuse the mode or a table.
+    """
+    prefix = build_inline_lut_prefix(inline_luts, lut_family=lut_family) if inline_luts else b""
+    problem = mode_problem(mode, lut_family=lut_family, stored_luts=stored_luts, inline_luts=inline_luts)
+    if problem is not None:
+        raise ValueError(f"The device would refuse this drive: {problem}")
+    return prefix
+
+
+async def drive_write(  # pylint: disable=too-many-arguments,too-many-locals
     uploader: Uploader,
     channel: SecureChannel,
     mode: DisplayMode,
@@ -57,31 +82,47 @@ async def drive_write(  # pylint: disable=too-many-arguments
     stream: bytes | None = None,
     refresh: RefreshMode = RefreshMode.FULL,
     progress_callback: Callable[[int, int], None] | None = None,
+    inline_luts: Mapping[int, bytes] | None = None,
+    lut_family: int = 0,
+    stored_luts: Sequence[DisplayLut] = (),
 ) -> int | None:
     """Upload ``frames`` (every pass, concatenated) in ``mode``; no CPU-heavy work here.
 
     Args:
-        stream: The frames as one zlib stream, to send compressed; ``None`` sends them as they are.
+        stream: The data as one zlib stream, to send compressed; ``None`` sends it as it is.
+            With ``inline_luts`` it must be the stream of ``drive_prefix(...) + frames`` (the
+            prefix is compressed together with the frames).
+        inline_luts: Tables (raw, slot id -> bytes) that shadow the stored 0xAF slots for this
+            transfer only (START flag INLINE_LUT).
+        lut_family: The 0xB1 tail's ``lut_family`` (0 = undeclared: the device lints nothing
+            but inline table sizes).
+        stored_luts: The config's 0xAF slots, to check that every slot the mode uploads exists.
 
     Returns:
         The panel temperature the device reported, or ``None`` when unknown.
 
     Raises:
+        ValueError: The device would refuse the mode or an inline table; nothing was sent.
         DriveModeSubstitutedError: The device runs another mode; nothing was sent after START.
         DriveModeTemperatureError, DriveSequenceUnsupportedError, PanelBusyError,
         NeedsMigrationError: The device refused the START.
         InvalidResponseError: Another refusal, or the device expects another pass count.
     """
+    prefix = drive_prefix(mode, inline_luts=inline_luts, lut_family=lut_family, stored_luts=stored_luts)
     compressed = stream is not None
     if stream is not None:
         room = channel.start_payload_limit() - _START_HEAD
         start = build_drive_write_start(
-            mode.mode_index, refresh.value, uncompressed_size=len(frames), first_chunk=stream[:room]
+            mode.mode_index,
+            refresh.value,
+            uncompressed_size=len(prefix) + len(frames),
+            first_chunk=stream[:room],
+            inline_len=len(prefix),
         )
         remaining = stream[room:]
     else:
-        start = build_drive_write_start(mode.mode_index, refresh.value)
-        remaining = frames
+        start = build_drive_write_start(mode.mode_index, refresh.value, inline_len=len(prefix))
+        remaining = prefix + frames
 
     await channel.write(start)
     answer = await channel.read(

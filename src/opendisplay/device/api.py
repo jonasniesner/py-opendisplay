@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
@@ -33,7 +33,7 @@ from ..models.profile import DeviceProfile, build_profile
 from ..panels import MigrationPlan, PanelDatabase, plan_migration
 from ..protocol.config_parser import parse_config_response
 from ..sec2.keystore import KeyStore
-from .drive_write import drive_write
+from .drive_write import drive_prefix, drive_write
 from .facade import OpenDisplayDevice
 from .imaging import prepare_multipass
 from .security import SecurityView
@@ -191,8 +191,12 @@ class DisplayView:
         compress: bool = True,
         use_measured_palettes: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
+        inline_luts: Mapping[int, bytes] | None = None,
     ) -> int | None:
         """Draw ``image``, in a config-declared drive mode when ``mode`` names one.
+
+        ``inline_luts`` (``mode`` only) sends raw tables, slot id -> bytes, ahead of the frames
+        (START flag INLINE_LUT); they stand in for the stored 0xAF slots for this one update.
 
         Without ``mode`` this is ``OpenDisplayDevice.upload_image`` with the same options
         (``use_measured_palettes`` is then the device's own setting). With ``mode`` the image is
@@ -210,6 +214,8 @@ class DisplayView:
         """
         legacy = self._device.legacy
         if mode is None:
+            if inline_luts:
+                raise ValueError("inline_luts needs a drive mode (mode=)")
             await legacy.upload_image(
                 image,
                 refresh_mode=refresh_mode,
@@ -226,6 +232,11 @@ class DisplayView:
         drive_mode = self.drive_mode(mode)
         config = self._device.config.cached
         assert config is not None
+        panel = next((p for p in config.display_panels if p.instance_number == drive_mode.instance_number), None)
+        ext = panel.ext if panel is not None else None
+        lut_family = ext.lut_family if ext is not None and ext.lut_family is not None else 0
+        stored_luts = config.display_luts
+        prefix = drive_prefix(drive_mode, inline_luts=inline_luts, lut_family=lut_family, stored_luts=stored_luts)
         # Device wraps OpenDisplayDevice until piece 7 inverts the two; these are its internals.
         uploader = legacy._uploader  # pylint: disable=protected-access
         compressed = compress and uploader.supports_compression
@@ -243,7 +254,11 @@ class DisplayView:
                 fit=fit,
                 rotate=rotate,
             )
-            stream = compress_image_data(frames, level=6, window_bits=FIRMWARE_ZLIB_WINDOW_BITS) if compressed else None
+            stream = (
+                compress_image_data(prefix + frames, level=6, window_bits=FIRMWARE_ZLIB_WINDOW_BITS)
+                if compressed
+                else None
+            )
             return frames, stream
 
         frames, stream = await asyncio.to_thread(encode)
@@ -256,6 +271,9 @@ class DisplayView:
                 stream=stream,
                 refresh=refresh_mode,
                 progress_callback=progress_callback,
+                inline_luts=inline_luts,
+                lut_family=lut_family,
+                stored_luts=stored_luts,
             )
 
 
