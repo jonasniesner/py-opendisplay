@@ -95,6 +95,7 @@
     "DisplayPanel",
     "DisplayView",
     "DitherMode",
+    "DriveEtagMismatchError",
     "DriveModeSubstitutedError",
     "DriveModeTemperatureError",
     "DriveSequenceUnsupportedError",

@@ -12,6 +12,7 @@ from ..exceptions import (
     ConfigKeyMismatchError,
     ConfigSecretNeedsClaimError,
     ConfigWriteBusyError,
+    DriveEtagMismatchError,
     DriveModeTemperatureError,
     DriveSequenceUnsupportedError,
     InvalidResponseError,
@@ -461,6 +462,7 @@ DRIVE_NACK_UNSUPPORTED = 0x05
 DRIVE_NACK_TEMP_RANGE = 0x06
 DRIVE_NACK_SEQ_UNSUPPORTED = 0x07
 DRIVE_NACK_PANEL_BUSY = 0x08
+DRIVE_NACK_ETAG_MISMATCH = 0x09
 _DRIVE_NACK_NAMES = {
     DRIVE_NACK_BAD_ARGS: "bad arguments",
     DRIVE_NACK_BAD_MODE: "mode not in the config",
@@ -481,6 +483,7 @@ def parse_drive_write_start(data: bytes) -> tuple[int, int, int | None]:
         DriveModeTemperatureError: 0x06, the temperature is outside the mode's window.
         DriveSequenceUnsupportedError: 0x07.
         PanelBusyError: 0x08, transient.
+        DriveEtagMismatchError: 0x09, the panel no longer shows the frame START named.
         NeedsMigrationError: 0x02, no display or no drive data.
         InvalidResponseError: Any other refusal (code named), or a malformed answer.
     """
@@ -492,6 +495,8 @@ def parse_drive_write_start(data: bytes) -> tuple[int, int, int | None]:
             raise DriveSequenceUnsupportedError()
         if err == DRIVE_NACK_PANEL_BUSY:
             raise PanelBusyError()
+        if err == DRIVE_NACK_ETAG_MISMATCH:
+            raise DriveEtagMismatchError()
         if err == DRIVE_NACK_NO_CONFIG:
             raise NeedsMigrationError()
         name = _DRIVE_NACK_NAMES.get(err, "unknown error")

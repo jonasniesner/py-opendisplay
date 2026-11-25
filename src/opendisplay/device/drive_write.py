@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Final
 
 from ..exceptions import DriveModeSubstitutedError, DriveModeTemperatureError, InvalidResponseError
@@ -19,6 +20,7 @@ from ..models.panel_drive import DisplayLut, DisplayMode
 from ..protocol import CommandCode, validate_ack_response
 from ..protocol.commands import (
     build_direct_write_end_command,
+    build_direct_write_end_with_etag,
     build_drive_write_start,
     build_inline_lut_prefix,
 )
@@ -29,8 +31,19 @@ from .upload import Uploader
 _LOGGER = logging.getLogger(__name__)
 
 _START_HEAD: Final = 11  # [00][85][mode][refresh][flags][rsv:2][uncompressed_size:4]
+_ETAG_LEN: Final = 4  # [old_etag:4 BE] after rsv when the START carries flag ETAG
 _PASS_REFRESH_S: Final = 45.0  # budget for one pass boundary (a panel refresh, observed up to 35 s)
 _MIN_ACK_S: Final = 90.0
+
+
+@dataclass(frozen=True)
+class DriveWriteResult:
+    """What a drive write left on the device."""
+
+    #: The panel temperature the device reported, ``None`` when unknown.
+    temp_c: int | None
+    #: The etag the device now shows (END carried it and the device took it); ``None`` = none.
+    etag: int | None
 
 
 def start_timeout(passes: int, *, inline_data: bool, first_chunk: float) -> float:
@@ -85,7 +98,9 @@ async def drive_write(  # pylint: disable=too-many-arguments,too-many-locals
     inline_luts: Mapping[int, bytes] | None = None,
     lut_family: int = 0,
     stored_luts: Sequence[DisplayLut] = (),
-) -> int | None:
+    old_etag: int | None = None,
+    new_etag: int | None = None,
+) -> DriveWriteResult:
     """Upload ``frames`` (every pass, concatenated) in ``mode``; no CPU-heavy work here.
 
     Args:
@@ -97,31 +112,36 @@ async def drive_write(  # pylint: disable=too-many-arguments,too-many-locals
         lut_family: The 0xB1 tail's ``lut_family`` (0 = undeclared: the device lints nothing
             but inline table sizes).
         stored_luts: The config's 0xAF slots, to check that every slot the mode uploads exists.
+        old_etag: START flag ETAG (protocol 2.5): the etag of the frame the panel must still
+            show, or the device refuses before drawing anything. ``None`` sends no flag.
+        new_etag: Sent with END; the device shows it as its displayed etag afterwards.
 
     Returns:
-        The panel temperature the device reported, or ``None`` when unknown.
+        The panel temperature, and the etag the device now shows.
 
     Raises:
         ValueError: The device would refuse the mode or an inline table; nothing was sent.
         DriveModeSubstitutedError: The device runs another mode; nothing was sent after START.
         DriveModeTemperatureError, DriveSequenceUnsupportedError, PanelBusyError,
         NeedsMigrationError: The device refused the START.
+        DriveEtagMismatchError: The panel no longer shows ``old_etag``; nothing was drawn.
         InvalidResponseError: Another refusal, or the device expects another pass count.
     """
     prefix = drive_prefix(mode, inline_luts=inline_luts, lut_family=lut_family, stored_luts=stored_luts)
     compressed = stream is not None
     if stream is not None:
-        room = channel.start_payload_limit() - _START_HEAD
+        room = channel.start_payload_limit() - _START_HEAD - (_ETAG_LEN if old_etag is not None else 0)
         start = build_drive_write_start(
             mode.mode_index,
             refresh.value,
             uncompressed_size=len(prefix) + len(frames),
             first_chunk=stream[:room],
             inline_len=len(prefix),
+            old_etag=old_etag,
         )
         remaining = stream[room:]
     else:
-        start = build_drive_write_start(mode.mode_index, refresh.value, inline_len=len(prefix))
+        start = build_drive_write_start(mode.mode_index, refresh.value, inline_len=len(prefix), old_etag=old_etag)
         remaining = prefix + frames
 
     await channel.write(start)
@@ -142,7 +162,13 @@ async def drive_write(  # pylint: disable=too-many-arguments,too-many-locals
 
     auto_completed = await uploader.send_data_chunks(remaining, progress_callback) if remaining else False
     if not auto_completed:
-        await channel.write(build_direct_write_end_command(refresh.value))
+        end = (
+            build_direct_write_end_with_etag(refresh.value, new_etag)
+            if new_etag is not None
+            else build_direct_write_end_command(refresh.value)
+        )
+        await channel.write(end)
         validate_ack_response(await channel.read(end_timeout(passes)), CommandCode.DIRECT_WRITE_END)
     await uploader.await_refresh_complete()
-    return temp_c
+    # A firmware auto-END never sets the displayed etag.
+    return DriveWriteResult(temp_c, new_etag if not auto_completed else None)

@@ -18,6 +18,7 @@ import opendisplay
 from opendisplay import OpenDisplayDevice
 from opendisplay.device.imaging import prepare_multipass
 from opendisplay.exceptions import (
+    DriveEtagMismatchError,
     DriveModeSubstitutedError,
     DriveModeTemperatureError,
     DriveSequenceUnsupportedError,
@@ -26,6 +27,8 @@ from opendisplay.exceptions import (
     PanelBusyError,
 )
 from opendisplay.models.config import GlobalConfig
+from opendisplay.models.panel_drive import DisplayMode
+from opendisplay.panels.prior import PriorConflictError
 from opendisplay.protocol.commands import build_drive_write_start
 from opendisplay.protocol.config_parser import parse_config_response
 from opendisplay.protocol.config_serializer import serialize_config
@@ -336,3 +339,110 @@ async def test_nominal_colours_are_reported_for_an_unmeasured_multi_pass_mode(fa
 
     assert dev.display.nominal_colours(dev.display.drive_mode("colour16")) is True
     assert dev.display.nominal_colours(dev.display.drive_mode("full")) is False
+
+
+# ── drive-write etag (protocol 2.5, Firmware_Unified #114) ───────────────────
+
+IDENT_25 = bytes.fromhex("004605030001300c800000")  # the BG22 identity, proto_minor 5
+IDENT_24 = bytes.fromhex("004604030001300c800000")
+HOLD_TAIL = bytes.fromhex("010001ff0c")  # ext v1, cost 1, no scrub, codes 2/3 hold
+
+
+def _with_hold(config):  # noqa: ANN001, ANN202
+    """``config`` with the 0xAE body of mode "full" ending in ``HOLD_TAIL``."""
+    pkts = [
+        dataclasses.replace(p, body=p.body + HOLD_TAIL)
+        if p.packet_type == 0xAE and DisplayMode.from_body(p.body).name == "full"
+        else p
+        for p in config.length_prefixed_packets
+    ]
+    out = dataclasses.replace(config, length_prefixed_packets=pkts)
+    assert next(m for m in out.display_modes if m.name == "full").ext.hold_codes == {2, 3}
+    return out
+
+
+async def _connected_ident(fake_transport, ident: bytes, config=ALPHA):  # noqa: ANN001, ANN202
+    fake = fake_transport([_version(), ident, SEC_UNCLAIMED, _config_reply(config)])
+    dev = opendisplay.connect(transport=fake)
+    await dev.__aenter__()
+    fake.written.clear()
+    fake.timeouts.clear()
+    return dev, fake
+
+
+def _full_len(config) -> int:  # noqa: ANN001
+    frames, _ = prepare_multipass(_image(), config, next(m for m in config.display_modes if m.name == "full"))
+    return len(frames)
+
+
+def test_start_carries_flag_and_big_endian_etag() -> None:
+    assert build_drive_write_start(1, 0, old_etag=0x11223344) == bytes.fromhex("0085010008000011223344")
+
+
+def test_compressed_start_puts_the_etag_before_the_size() -> None:
+    cmd = build_drive_write_start(1, 0, uncompressed_size=16, first_chunk=b"\x78", old_etag=0xA0B0C0D0)
+    assert cmd == bytes.fromhex("0085010009 0000 a0b0c0d0 10000000 78".replace(" ", ""))
+
+
+def test_etag_out_of_range_is_refused() -> None:
+    with pytest.raises(ValueError, match="old_etag"):
+        build_drive_write_start(1, 0, old_etag=1 << 32)
+
+
+def test_nack_09_is_an_etag_mismatch() -> None:
+    with pytest.raises(DriveEtagMismatchError):
+        parse_drive_write_start(bytes([0xFF, 0x85, 0x09, 0x00]))
+
+
+async def test_proto_25_end_carries_a_new_etag(fake_transport) -> None:
+    dev, fake = await _connected_ident(fake_transport, IDENT_25)
+    _script_transfer(dev, fake, bytes.fromhex("0085000119"), _full_len(ALPHA))
+
+    await dev.display.show(_image(), mode="full")
+
+    assert fake.written[0] == bytes.fromhex("00850000000000")  # no prior: no ETAG flag
+    end = fake.written[-1]
+    assert end[:3] == b"\x00\x72\x00" and len(end) == 7
+    assert dev.display.last_etag == int.from_bytes(end[3:], "big") != 0
+
+
+async def test_proto_24_sends_no_etag(fake_transport) -> None:
+    dev, fake = await _connected_ident(fake_transport, IDENT_24)
+    _script_transfer(dev, fake, bytes.fromhex("0085000119"), _full_len(ALPHA))
+
+    await dev.display.show(_image(), mode="full")
+
+    assert fake.written[-1] == b"\x00\x72\x00"
+    assert dev.display.last_etag is None
+
+
+async def test_prior_names_its_etag_and_a_mismatch_draws_nothing(fake_transport) -> None:
+    config = _with_hold(ALPHA)
+    dev, fake = await _connected_ident(fake_transport, IDENT_25, config)
+    _script_transfer(dev, fake, bytes.fromhex("0085000119"), _full_len(config))
+    await dev.display.show(_image(), mode="full")
+    prior, etag = dev.display.last_frame, dev.display.last_etag
+    assert prior is not None and etag
+    fake.written.clear()
+
+    fake._responses.append(bytes([0xFF, 0x85, 0x09, 0x00]))  # noqa: SLF001
+    with pytest.raises(DriveEtagMismatchError):
+        await dev.display.show(_image(), mode="full", prior=prior, prior_etag=etag)
+
+    assert fake.written == [bytes.fromhex("0085000008 0000".replace(" ", "")) + etag.to_bytes(4, "big")]
+    assert dev.display.last_frame is None and dev.display.last_etag is None
+
+
+async def test_a_prior_without_an_etag_is_refused_before_any_io(fake_transport) -> None:
+    config = _with_hold(ALPHA)
+    dev, fake = await _connected_ident(fake_transport, IDENT_25, config)
+    _script_transfer(dev, fake, bytes.fromhex("0085000119"), _full_len(config))
+    await dev.display.show(_image(), mode="full")
+    prior = dev.display.last_frame
+    assert prior is not None
+    fake.written.clear()
+
+    with pytest.raises(PriorConflictError, match="etag"):
+        await dev.display.show(_image(), mode="full", prior=prior)
+
+    assert fake.written == []

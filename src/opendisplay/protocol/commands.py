@@ -279,6 +279,10 @@ DRIVE_WRITE_FLAG_COMPRESSED = 0x01  # payload carries uncompressed_size + zlib s
 #: The two reserved bytes are ``inline_len`` and the stream starts with that many bytes of
 #: inline tables (provisional, Firmware_Unified fw-refresh-modes docs/REFRESH_MODES.md).
 DRIVE_WRITE_FLAG_INLINE_LUT = 0x04
+#: Protocol 2.5: ``[old_etag:4 BE]`` follows the header; the device refuses the write (NACK 0x09)
+#: unless it still shows that frame. Send only to READ_IDENT ``proto_minor >= 5``.
+DRIVE_WRITE_FLAG_ETAG = 0x08
+DRIVE_WRITE_ETAG_MIN_PROTO_MINOR = 5
 INLINE_LUT_HEADER = 5  # [slot_id:1][len:2 LE][crc16:2 LE]
 
 
@@ -289,6 +293,7 @@ def build_drive_write_start(
     uncompressed_size: int | None = None,
     first_chunk: bytes = b"",
     inline_len: int = 0,
+    old_etag: int | None = None,
 ) -> bytes:
     """Build CMD_DRIVE_WRITE_START (0x0085): a full-frame write in a config-declared drive mode.
 
@@ -304,19 +309,28 @@ def build_drive_write_start(
         uncompressed_size: The stream's total uncompressed size; ``None`` for an uncompressed write.
         first_chunk: The first compressed bytes (compressed writes only).
         inline_len: Bytes of inline tables at the start of the stream; 0 = none.
+        old_etag: Sets flag ETAG (protocol 2.5) and sends ``[old_etag:4 BE]`` after the header:
+            the etag of the frame the panel must still show (0 claims nothing); ``None`` = no flag.
 
     Raises:
-        ValueError: ``first_chunk`` without ``uncompressed_size``, or ``inline_len`` not a u16.
+        ValueError: ``first_chunk`` without ``uncompressed_size``, ``inline_len`` not a u16, or
+            ``old_etag`` not a u32.
     """
     if not 0 <= inline_len <= 0xFFFF:
         raise ValueError(f"inline_len must fit a u16, got {inline_len}")
+    if old_etag is not None and not 0 <= old_etag <= 0xFFFFFFFF:
+        raise ValueError(f"old_etag must be a u32, got {old_etag}")
     flags = DRIVE_WRITE_FLAG_INLINE_LUT if inline_len else 0
+    etag = b""
+    if old_etag is not None:
+        flags |= DRIVE_WRITE_FLAG_ETAG
+        etag = old_etag.to_bytes(4, "big")
     reserved = inline_len.to_bytes(2, "little")
     if uncompressed_size is None:
         if first_chunk:
             raise ValueError("first_chunk needs uncompressed_size: inline data is only sent compressed")
-        return bytes([0x00, 0x85, mode, refresh, flags]) + reserved
-    head = bytes([0x00, 0x85, mode, refresh, flags | DRIVE_WRITE_FLAG_COMPRESSED]) + reserved
+        return bytes([0x00, 0x85, mode, refresh, flags]) + reserved + etag
+    head = bytes([0x00, 0x85, mode, refresh, flags | DRIVE_WRITE_FLAG_COMPRESSED]) + reserved + etag
     return head + uncompressed_size.to_bytes(4, "little") + first_chunk
 
 

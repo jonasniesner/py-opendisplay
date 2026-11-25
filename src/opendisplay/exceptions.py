@@ -214,6 +214,17 @@ class DriveModeTemperatureError(ProtocolError):
         super().__init__(f"The panel temperature is outside drive mode '{mode}''s window{window}.")
 
 
+class DriveEtagMismatchError(ProtocolError):
+    """The panel no longer shows the prior frame (0x0085 NACK 0x09, protocol 2.5); nothing was drawn.
+
+    The device rebooted, drew a boot or claim screen, or another host wrote to it since the
+    frame the caller named. The device has cleared its displayed etag; send a full frame instead.
+    """
+
+    def __init__(self, message: str = "The panel no longer shows the prior frame (etag mismatch).") -> None:
+        super().__init__(message)
+
+
 class DriveSequenceUnsupportedError(ProtocolError):
     """The drive mode's sequence uses an escape this firmware does not implement (refused at START)."""
 

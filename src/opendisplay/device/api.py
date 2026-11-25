@@ -31,7 +31,9 @@ from ..firmware.releases import can_roll_back
 from ..models.enums import FitMode, RefreshMode, Rotation
 from ..models.profile import DeviceProfile, build_profile
 from ..panels import MigrationPlan, PanelDatabase, plan_migration
-from ..panels.prior import mask_unchanged
+from ..panels.prior import PriorConflictError, mask_unchanged
+from ..partial import _generate_etag
+from ..protocol.commands import DRIVE_WRITE_ETAG_MIN_PROTO_MINOR
 from ..protocol.config_parser import parse_config_response
 from ..sec2.keystore import KeyStore
 from .drive_write import drive_prefix, drive_write
@@ -151,6 +153,15 @@ class DisplayView:
         self.last_frame: bytes | None = None
         #: Pixels driven by the last ``show`` (``None`` = all; set when a prior masked the frame).
         self.last_changed: int | None = None
+        #: The etag the panel shows after the last ``show`` (protocol 2.5 and later; ``None`` =
+        #: none). Pass it back as ``prior_etag`` with ``last_frame``.
+        self.last_etag: int | None = None
+
+    @property
+    def checks_etag(self) -> bool:
+        """Whether the firmware checks a drive write's prior etag (READ_IDENT proto_minor >= 5)."""
+        ident = self._device.profile.ident
+        return ident is not None and ident.proto_minor >= DRIVE_WRITE_ETAG_MIN_PROTO_MINOR
 
     def drive_mode(self, name: str) -> DisplayMode:
         """Display 0's drive mode called ``name`` (case-insensitive), as the config declares it. No I/O.
@@ -199,6 +210,7 @@ class DisplayView:
         progress_callback: Callable[[int, int], None] | None = None,
         inline_luts: Mapping[int, bytes] | None = None,
         prior: bytes | None = None,
+        prior_etag: int | None = None,
     ) -> int | None:
         """Draw ``image``, in a config-declared drive mode when ``mode`` names one.
 
@@ -207,6 +219,11 @@ class DisplayView:
         changed is sent as a hold code, so only changed pixels are driven
         (``opendisplay.panels.prior``). A changed pixel the mode cannot draw raises
         ``PriorConflictError`` before any I/O; the caller then runs a stock mode instead.
+
+        ``prior_etag`` is the etag that update left (``last_etag``). Firmware that checks it
+        (``checks_etag``) refuses the write when the panel no longer shows that frame (a reboot,
+        a boot screen, another host's write): ``DriveEtagMismatchError``, nothing drawn. On such
+        firmware a prior without an etag cannot be proven and raises ``PriorConflictError``.
 
         ``inline_luts`` (``mode`` only) sends raw tables, slot id -> bytes, ahead of the frames
         (START flag INLINE_LUT); they stand in for the stored 0xAF slots for this one update.
@@ -224,6 +241,7 @@ class DisplayView:
         Raises:
             ValueError: See ``drive_mode``; raised before any I/O.
             DriveModeSubstitutedError: The device runs another mode; nothing was uploaded.
+            DriveEtagMismatchError: The panel no longer shows ``prior``; nothing was drawn.
         """
         legacy = self._device.legacy
         if mode is None:
@@ -256,6 +274,12 @@ class DisplayView:
 
         hold = drive_mode.ext.hold_codes if drive_mode.ext is not None else frozenset()
         display = config.displays[0] if config.displays else None
+        etag_checked = self.checks_etag
+        use_prior = prior is not None and bool(hold) and drive_mode.passes <= 1 and display is not None
+        if use_prior and etag_checked and not prior_etag:
+            raise PriorConflictError("the prior has no etag, so this firmware cannot confirm the panel still shows it")
+        old_etag = prior_etag if use_prior and etag_checked else None
+        new_etag = _generate_etag() if etag_checked else None
 
         def encode() -> tuple[bytes, bytes | None, bytes, int | None]:
             frames, _ = prepare_multipass(
@@ -271,7 +295,7 @@ class DisplayView:
                 rotate=rotate,
             )
             unmasked, changed = frames, None
-            if prior is not None and hold and drive_mode.passes <= 1 and display is not None:
+            if use_prior and prior is not None and display is not None:
                 masked = mask_unchanged(frames, prior, hold, display.pixel_width * display.pixel_height)
                 frames, changed = masked.frame, masked.changed
             stream = (
@@ -283,8 +307,9 @@ class DisplayView:
 
         frames, stream, unmasked, changed = await asyncio.to_thread(encode)
         self.last_frame = None
+        self.last_etag = None
         async with legacy._transaction():  # pylint: disable=protected-access
-            temp_c = await drive_write(
+            result = await drive_write(
                 uploader,
                 legacy._channel,  # pylint: disable=protected-access
                 drive_mode,
@@ -295,10 +320,13 @@ class DisplayView:
                 inline_luts=inline_luts,
                 lut_family=lut_family,
                 stored_luts=stored_luts,
+                old_etag=old_etag,
+                new_etag=new_etag,
             )
         self.last_frame = unmasked if drive_mode.passes <= 1 else None
         self.last_changed = changed
-        return temp_c
+        self.last_etag = result.etag
+        return result.temp_c
 
 
 class FirmwareView:
