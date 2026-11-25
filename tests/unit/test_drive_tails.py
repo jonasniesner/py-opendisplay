@@ -162,7 +162,7 @@ def test_mode_tail_layout() -> None:
         ModeExt(mode_flags=1),
         ModeExt(mode_flags=1, budget_cost=5),
         ModeExt(mode_flags=0, budget_cost=0, scrub_before=4),
-        ModeExt(mode_flags=1, budget_cost=1, scrub_before=SCRUB_NONE, ext_version=2, extra=b"\x09\x08"),
+        ModeExt(mode_flags=1, budget_cost=1, scrub_before=SCRUB_NONE, hold_mask=0, ext_version=2, extra=b"\x09\x08"),
     ],
 )
 def test_mode_tail_round_trips(ext: ModeExt) -> None:

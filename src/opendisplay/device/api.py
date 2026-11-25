@@ -31,6 +31,7 @@ from ..firmware.releases import can_roll_back
 from ..models.enums import FitMode, RefreshMode, Rotation
 from ..models.profile import DeviceProfile, build_profile
 from ..panels import MigrationPlan, PanelDatabase, plan_migration
+from ..panels.prior import mask_unchanged
 from ..protocol.config_parser import parse_config_response
 from ..sec2.keystore import KeyStore
 from .drive_write import drive_prefix, drive_write
@@ -145,6 +146,11 @@ class DisplayView:
 
     def __init__(self, device: Device) -> None:
         self._device = device
+        #: The unmasked frame of the last successful single-pass ``show(mode=...)``: what the
+        #: panel shows now, for the caller to keep as the next update's ``prior``.
+        self.last_frame: bytes | None = None
+        #: Pixels driven by the last ``show`` (``None`` = all; set when a prior masked the frame).
+        self.last_changed: int | None = None
 
     def drive_mode(self, name: str) -> DisplayMode:
         """Display 0's drive mode called ``name`` (case-insensitive), as the config declares it. No I/O.
@@ -176,7 +182,7 @@ class DisplayView:
             for c in config.display_calibrations
         )
 
-    async def show(  # pylint: disable=too-many-arguments
+    async def show(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         image: Image.Image,
         *,
@@ -192,8 +198,15 @@ class DisplayView:
         use_measured_palettes: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
         inline_luts: Mapping[int, bytes] | None = None,
+        prior: bytes | None = None,
     ) -> int | None:
         """Draw ``image``, in a config-declared drive mode when ``mode`` names one.
+
+        ``prior`` (``mode`` only) is the frame the panel shows now (``last_frame`` of the update
+        that drew it). When the mode's 0xAE tail declares hold codes, every pixel that has not
+        changed is sent as a hold code, so only changed pixels are driven
+        (``opendisplay.panels.prior``). A changed pixel the mode cannot draw raises
+        ``PriorConflictError`` before any I/O; the caller then runs a stock mode instead.
 
         ``inline_luts`` (``mode`` only) sends raw tables, slot id -> bytes, ahead of the frames
         (START flag INLINE_LUT); they stand in for the stored 0xAF slots for this one update.
@@ -241,7 +254,10 @@ class DisplayView:
         uploader = legacy._uploader  # pylint: disable=protected-access
         compressed = compress and uploader.supports_compression
 
-        def encode() -> tuple[bytes, bytes | None]:
+        hold = drive_mode.ext.hold_codes if drive_mode.ext is not None else frozenset()
+        display = config.displays[0] if config.displays else None
+
+        def encode() -> tuple[bytes, bytes | None, bytes, int | None]:
             frames, _ = prepare_multipass(
                 image,
                 config,
@@ -254,16 +270,21 @@ class DisplayView:
                 fit=fit,
                 rotate=rotate,
             )
+            unmasked, changed = frames, None
+            if prior is not None and hold and drive_mode.passes <= 1 and display is not None:
+                masked = mask_unchanged(frames, prior, hold, display.pixel_width * display.pixel_height)
+                frames, changed = masked.frame, masked.changed
             stream = (
                 compress_image_data(prefix + frames, level=6, window_bits=FIRMWARE_ZLIB_WINDOW_BITS)
                 if compressed
                 else None
             )
-            return frames, stream
+            return frames, stream, unmasked, changed
 
-        frames, stream = await asyncio.to_thread(encode)
+        frames, stream, unmasked, changed = await asyncio.to_thread(encode)
+        self.last_frame = None
         async with legacy._transaction():  # pylint: disable=protected-access
-            return await drive_write(
+            temp_c = await drive_write(
                 uploader,
                 legacy._channel,  # pylint: disable=protected-access
                 drive_mode,
@@ -275,6 +296,9 @@ class DisplayView:
                 lut_family=lut_family,
                 stored_luts=stored_luts,
             )
+        self.last_frame = unmasked if drive_mode.passes <= 1 else None
+        self.last_changed = changed
+        return temp_c
 
 
 class FirmwareView:

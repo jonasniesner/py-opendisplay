@@ -14,7 +14,7 @@ library's proposal for testing the firmware side against. Every version only app
 so a reader of version N parses the fields it knows from any version >= N and keeps the rest
 as ``extra``. Fields after the core may be left off; a missing field reads as ``None``.
 
-0xAE mode tail, ``ext_version`` 1 (4 bytes)::
+0xAE mode tail, ``ext_version`` 1 (2 bytes core + 3 optional)::
 
     [0] ext_version  u8   1
     [1] mode_flags   u8   bit0 EXPERIMENTAL; bits 1-7 reserved (0)
@@ -22,6 +22,11 @@ as ``extra``. Fields after the core may be left off; a missing field reads as ``
                           mode, which resets the host's count          (optional)
     [3] scrub_before u8   mode_index the host must run right before pass 1 of this mode
                           (multi-pass); 0xFF = none                     (optional)
+    [4] hold_mask    u8   bit n set = frame code n leaves a pixel as it is in this mode. With
+                          a known prior frame the host sends the lowest such code for every
+                          unchanged pixel, so only changed pixels are driven; a changed pixel
+                          whose new code is in the mask cannot be drawn by this mode (the host
+                          runs a stock full instead). 0x00 or 0xFF = none (optional)
 
 0xB1 drive tail, ``ext_version`` 1 (6 bytes core + 3 optional)::
 
@@ -104,10 +109,12 @@ class ModeExt:
     mode_flags: int = 0
     budget_cost: int | None = None
     scrub_before: int | None = None
+    hold_mask: int | None = None
     ext_version: int = EXT_VERSION
     extra: bytes = b""  # fields of a later ext_version, verbatim
 
     _CORE: ClassVar[int] = 2
+    _KNOWN: ClassVar[int] = 5
 
     @property
     def experimental(self) -> bool:
@@ -119,18 +126,25 @@ class ModeExt:
         """The mode that must run right before this one, or ``None``."""
         return None if self.scrub_before in (None, SCRUB_NONE) else self.scrub_before
 
+    @property
+    def hold_codes(self) -> frozenset[int]:
+        """The frame codes that leave a pixel as it is in this mode (empty = none)."""
+        if self.hold_mask in (None, 0, 0xFF):
+            return frozenset()
+        return frozenset(n for n in range(8) if self.hold_mask >> n & 1)
+
     @classmethod
     def from_tail(cls, tail: bytes) -> Self | None:
         """Parse a mode tail; ``None`` for an empty tail, version 0 or a truncated core."""
         if len(tail) < cls._CORE or tail[0] < 1:
             return None
-        known = 4
         return cls(
             ext_version=tail[0],
             mode_flags=tail[1],
             budget_cost=_u8_field(tail, 2),
             scrub_before=_u8_field(tail, 3),
-            extra=tail[known:],
+            hold_mask=_u8_field(tail, 4),
+            extra=tail[cls._KNOWN :],
         )
 
     def to_bytes(self) -> bytes:
@@ -141,10 +155,10 @@ class ModeExt:
         """
         _check_u8("mode tail", ext_version=self.ext_version, mode_flags=self.mode_flags)
         out = bytearray([self.ext_version, self.mode_flags])
-        optional = [self.budget_cost, self.scrub_before]
+        optional = [self.budget_cost, self.scrub_before, self.hold_mask]
         _append_optional(out, optional, "mode tail")
         if self.extra:
-            if len(out) != 4:
+            if len(out) != self._KNOWN:
                 raise ValueError("mode tail: extra bytes need every version-1 field set")
             out += self.extra
         return bytes(out)
