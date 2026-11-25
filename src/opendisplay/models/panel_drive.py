@@ -268,17 +268,18 @@ def find_lut(luts: list[DisplayLut] | tuple[DisplayLut, ...], instance_number: i
 class CalibrationEntry:
     """One renderable colour of a mode: the panel codes that produce it and its measured CIELAB."""
 
-    codes: int  # packed 2-bit panel codes, pass p in bits [2p+1:2p]
+    codes: int  # packed panel codes, pass p in bits [b*p+b-1:b*p] with b = code_bits
     lab_l: float
     lab_a: float
     lab_b: float
+    code_bits: int = 2  # 3 when the packet sets the 3-bit flag (Spectra 6: K0 W1 Y2 R3 B5 G6, 4/7 hold)
 
     def code_for_pass(self, pass_index: int) -> int:
-        """The 2-bit panel code this colour uses in pass ``pass_index`` (0-based).
+        """The panel code this colour uses in pass ``pass_index`` (0-based), ``code_bits`` wide.
 
         These are panel codes already; never apply ``DisplayPanel.code_map`` to them.
         """
-        return (self.codes >> (2 * pass_index)) & 0x03
+        return (self.codes >> (self.code_bits * pass_index)) & ((1 << self.code_bits) - 1)
 
 
 @dataclass(frozen=True)
@@ -294,11 +295,23 @@ class DisplayCalibration:
     # codes is unsigned; L*, a* and b* are signed int16 (x100), as the firmware header documents them.
     _ENTRY: ClassVar[struct.Struct] = struct.Struct("<Hhhh")
     _FLAG_MEASURED: ClassVar[int] = 0x01
+    # Protocol structs 2.4: entry codes are 3-bit (pass p in bits [3p+2:3p], at most 5 passes).
+    _FLAG_CODES_3BIT: ClassVar[int] = 0x02
 
     @property
     def measured(self) -> bool:
         """True if the colours were measured on this unit; False if they are nominal placeholders."""
         return bool(self.flags & self._FLAG_MEASURED)
+
+    @property
+    def code_bits(self) -> int:
+        """Width of one pass's panel code in ``CalibrationEntry.codes``: 2 (BWRY) or 3 (Spectra 6)."""
+        return 3 if self.flags & self._FLAG_CODES_3BIT else 2
+
+    @property
+    def max_passes(self) -> int:
+        """How many passes the 16-bit ``codes`` field can describe at this code width."""
+        return 16 // self.code_bits
 
     @classmethod
     def from_body(cls, body: bytes) -> Self:
@@ -311,7 +324,7 @@ class DisplayCalibration:
         instance, mode_index, flags, count = cls._HEAD.unpack_from(body)
         _require(body, cls._HEAD.size + count * cls._ENTRY.size, "display_calibration")
         entries = tuple(
-            CalibrationEntry(codes, lab_l / 100, lab_a / 100, lab_b / 100)
+            CalibrationEntry(codes, lab_l / 100, lab_a / 100, lab_b / 100, 3 if flags & cls._FLAG_CODES_3BIT else 2)
             for codes, lab_l, lab_a, lab_b in (
                 cls._ENTRY.unpack_from(body, cls._HEAD.size + i * cls._ENTRY.size) for i in range(count)
             )

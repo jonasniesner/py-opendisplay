@@ -352,14 +352,10 @@ def prepare_multipass(  # pylint: disable=too-many-arguments
         The uncompressed frames, concatenated, and the dithered preview.
 
     Raises:
-        ImageEncodingError: A multi-pass mode without a 0xB0 calibration packet or with a scheme
-            other than BWRY16, or a single-pass mode whose scheme is not the display's.
+        ImageEncodingError: A multi-pass mode without a 0xB0 calibration packet, a multi-pass mode
+            that is neither BWRY16 (2-bit codes) nor a Spectra 6 mode inheriting the panel's scheme
+            (3-bit codes), or a single-pass mode whose scheme is not the display's.
     """
-    if mode.passes > 1 and mode.color_scheme != SCHEME_BWRY16:
-        raise ImageEncodingError(
-            f"Drive mode '{mode.name}' has {mode.passes} passes with scheme {mode.color_scheme}; "
-            f"only scheme {SCHEME_BWRY16} (BWRY16) multi-pass frames can be encoded"
-        )
     display_scheme = config.displays[0].color_scheme if config.displays else None
     if mode.passes <= 1 and mode.color_scheme not in (COLOR_SCHEME_INHERIT, display_scheme):
         raise ImageEncodingError(
@@ -393,10 +389,23 @@ def prepare_multipass(  # pylint: disable=too-many-arguments
             f"Drive mode '{mode.name}' has {mode.passes} passes but the config has no 0xB0 calibration "
             "packet for it, so its colours are unknown"
         )
+    spectra = (
+        mode.color_scheme in (COLOR_SCHEME_INHERIT, display_scheme)
+        and display_scheme in (ColorScheme.BWGBRY, ColorScheme.BWGBRY_SPLIT)
+        and calibration.code_bits == 3
+    )
+    bwry16 = mode.color_scheme == SCHEME_BWRY16 and calibration.code_bits == 2
+    if not (spectra or bwry16):
+        raise ImageEncodingError(
+            f"Drive mode '{mode.name}' has {mode.passes} passes with scheme {mode.color_scheme} and "
+            f"{calibration.code_bits}-bit palette codes on a scheme-{display_scheme} display; only BWRY16 "
+            "(2-bit codes) and Spectra 6 modes inheriting the panel's scheme (3-bit codes) can be encoded"
+        )
     image = _fit_for_display(image, _capabilities_from_config(config), rotate, fit)
     dithered = dither_image(
         image,
         mode_palette(calibration),
         DitherOptions(mode=dither_mode, serpentine=serpentine, exposure=exposure, saturation=saturation),
     )
-    return encode_multipass(np.asarray(dithered), calibration, mode.passes), dithered
+    split = spectra and display_scheme == ColorScheme.BWGBRY_SPLIT
+    return encode_multipass(np.asarray(dithered), calibration, mode.passes, half_planes=split), dithered

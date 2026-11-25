@@ -250,3 +250,124 @@ def test_code_map_applies_to_a_single_pass_mode_but_never_to_multi_pass_codes() 
     c16_plain, _ = prepare_multipass(red_yellow, plain, COLOUR16, dither_mode=DitherMode.NONE)
     c16_swapped, _ = prepare_multipass(red_yellow, swapped, COLOUR16, dither_mode=DitherMode.NONE)
     assert c16_plain == c16_swapped  # multi-pass codes are panel codes: code_map never applies
+
+
+# ── Spectra 6: 3-bit codes (protocol structs 2.4 cal_flags bit 1), 4 bpp pass frames ────────────
+
+import dataclasses  # noqa: E402
+import struct  # noqa: E402
+
+from opendisplay.models.panel_drive import LengthPrefixedPacket  # noqa: E402
+
+FLAG_3BIT = 0x02
+
+
+def _s6(codes: tuple[int, ...], lab: tuple[float, float, float]) -> CalibrationEntry:
+    packed = sum(c << (3 * p) for p, c in enumerate(codes))
+    return CalibrationEntry(codes=packed, lab_l=lab[0], lab_a=lab[1], lab_b=lab[2], code_bits=3)
+
+
+# Entry 0 = K then hold, 1 = W then B, 2 = Y then G, 3 = R then hold (codes 4 = hold).
+S6 = DisplayCalibration(
+    instance_number=0,
+    mode_index=5,
+    flags=FLAG_3BIT,
+    entries=(
+        _s6((0, 4), (12.0, 9.0, -6.0)),
+        _s6((1, 5), (45.0, 5.0, -30.0)),
+        _s6((2, 6), (60.0, -20.0, 40.0)),
+        _s6((3, 4), (35.0, 40.0, 25.0)),
+    ),
+)
+
+
+def test_three_bit_codes_read_three_bits_per_pass() -> None:
+    entry = _s6((6, 5, 7), (50.0, 0.0, 0.0))
+
+    assert [entry.code_for_pass(p) for p in range(3)] == [6, 5, 7]
+    assert S6.code_bits == 3 and S6.max_passes == 5
+
+
+def test_the_flag_sets_the_code_width_when_parsed() -> None:
+    body = bytes([0, 5, FLAG_3BIT | 0x01, 1]) + struct.pack("<Hhhh", 2 | (6 << 3), 6000, -2000, 4000)
+
+    cal = DisplayCalibration.from_body(body)
+
+    assert cal.code_bits == 3 and cal.measured
+    assert [cal.entries[0].code_for_pass(p) for p in range(2)] == [2, 6]
+    two_bit = DisplayCalibration.from_body(bytes([0, 5, 0x01]) + body[3:])
+    assert two_bit.code_bits == 2 and two_bit.entries[0].code_for_pass(1) == (2 | (6 << 3)) >> 2 & 3
+
+
+def test_exact_bytes_of_a_two_pass_spectra_frame() -> None:
+    idx = np.array([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=np.uint8)
+
+    data = encode_multipass(idx, S6, passes=2)
+
+    assert data == bytes([0x01, 0x23, 0x32, 0x10]) + bytes([0x45, 0x64, 0x46, 0x54])
+
+
+def test_split_panels_get_half_planes_per_pass() -> None:
+    idx = np.array([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=np.uint8)
+
+    data = encode_multipass(idx, S6, passes=2, half_planes=True)
+
+    # per pass: left halves of both rows, then right halves
+    assert data == bytes([0x01, 0x32, 0x23, 0x10]) + bytes([0x45, 0x46, 0x64, 0x54])
+
+
+def test_three_bit_codes_hold_at_most_five_passes() -> None:
+    with pytest.raises(ImageEncodingError, match="1 to 5 passes"):
+        encode_multipass(np.zeros((1, 2), dtype=np.uint8), S6, passes=6)
+
+
+def _spectra_config(scheme: int = 8, mode_scheme: int = 0xFF, flags: int = FLAG_3BIT):
+    """The alpha fixture turned into a Spectra panel with a 2-pass mode 1 and a 3-bit palette."""
+    display = dataclasses.replace(ALPHA.displays[0], color_scheme=scheme)
+    packets = []
+    for p in ALPHA.length_prefixed_packets:
+        body = p.body
+        if p.packet_type == 0xAE and body[1] == COLOUR16.mode_index:
+            body = body[:14] + bytes([mode_scheme, 2]) + body[16:]
+        if p.packet_type == 0xB0 and body[1] == COLOUR16.mode_index:
+            entries = b"".join(
+                struct.pack(
+                    "<Hhhh",
+                    sum(c << (3 * k) for k, c in enumerate(e.code_for_pass(q) for q in range(2))),
+                    round(e.lab_l * 100),
+                    round(e.lab_a * 100),
+                    round(e.lab_b * 100),
+                )
+                for e in S6.entries
+            )
+            body = bytes([body[0], body[1], flags, len(S6.entries)]) + entries
+        packets.append(LengthPrefixedPacket(number=p.number, packet_type=p.packet_type, body=body))
+    config = dataclasses.replace(ALPHA, displays=[display], length_prefixed_packets=packets)
+    mode = next(m for m in config.display_modes if m.mode_index == COLOUR16.mode_index)
+    return config, mode
+
+
+def test_a_spectra_split_mode_encodes_two_4bpp_passes() -> None:
+    config, mode = _spectra_config()
+
+    data, preview = prepare_multipass(_photo(), config, mode)
+
+    assert mode.passes == 2
+    assert len(data) == 2 * 360 * 92  # 184 px at 2 px per byte, two half planes of 46 B per row
+    codes = {b >> 4 for b in data} | {b & 15 for b in data}
+    assert codes <= {0, 1, 2, 3, 4, 5, 6}
+    assert preview.size == (184, 360)
+
+
+def test_a_spectra_mode_with_two_bit_codes_is_refused() -> None:
+    config, mode = _spectra_config(flags=0)
+
+    with pytest.raises(ImageEncodingError, match="2-bit palette codes"):
+        prepare_multipass(_photo(), config, mode)
+
+
+def test_three_bit_codes_on_a_bwry_panel_are_refused() -> None:
+    config, mode = _spectra_config(scheme=3)
+
+    with pytest.raises(ImageEncodingError, match="3-bit palette codes"):
+        prepare_multipass(_photo(), config, mode)
