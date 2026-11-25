@@ -11,6 +11,7 @@ dual-controller panels (BWGBRY_SPLIT). No I/O.
 
 from __future__ import annotations
 
+import math
 from typing import Final
 
 import numpy as np
@@ -25,11 +26,16 @@ MAX_PASSES: Final = 8  # CalibrationEntry.codes holds 2 bits for each of up to 8
 SCHEME_BWRY16: Final = 10  # the multi-pass scheme: 2 bpp per pass, colours from the 0xB0 palette
 
 
+_WHITE_MAX_CHROMA = 10.0
+
+
 def mode_palette(calibration: DisplayCalibration) -> Palette:
     """The palette a mode renders, from its 0xB0 entries, in entry order.
 
-    The entries are absolute CIELAB (measured or nominal); the lightest is taken as the paper
-    white. ``measured`` follows the packet's "measured on this unit" flag.
+    The entries are absolute CIELAB (measured or nominal); the lightest near-neutral entry
+    (C* <= 10) is taken as the paper white, or the lightest entry when none is neutral. Spectra 6
+    yellow measures about as light as white, so "lightest" alone can pick a yellow and shift
+    every colour. ``measured`` follows the packet's "measured on this unit" flag.
 
     Raises:
         ImageEncodingError: The calibration has no entries.
@@ -37,7 +43,8 @@ def mode_palette(calibration: DisplayCalibration) -> Palette:
     if not calibration.entries:
         raise ImageEncodingError(f"The calibration of drive mode {calibration.mode_index} has no colours")
     entries = [PaletteEntry(appearance=(e.lab_l, e.lab_a, e.lab_b)) for e in calibration.entries]
-    white = max(range(len(entries)), key=lambda i: calibration.entries[i].lab_l)
+    neutral = [i for i, e in enumerate(calibration.entries) if math.hypot(e.lab_a, e.lab_b) <= _WHITE_MAX_CHROMA]
+    white = max(neutral or range(len(entries)), key=lambda i: calibration.entries[i].lab_l)
     return Palette.from_absolute_lab(entries, white_index=white, measured=calibration.measured)
 
 

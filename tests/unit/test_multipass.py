@@ -93,6 +93,25 @@ def test_mode_palette_keeps_the_entry_order_and_takes_white_by_lightness() -> No
     assert palette.measured is False
 
 
+def test_mode_palette_takes_white_from_a_neutral_entry_when_yellow_is_lighter() -> None:
+    # Spectra 6 yellow can measure lighter than the panel white: the white stays the neutral entry.
+    calibration = DisplayCalibration(
+        0,
+        1,
+        0,
+        (
+            _entry(0, 0, 0, (20.0, 5.0, -5.0)),
+            _entry(1, 0, 0, (98.0, 0.5, 1.0)),  # white
+            _entry(2, 0, 0, (103.0, 1.0, 83.0)),  # yellow, lighter than white
+        ),
+    )
+
+    lightness = [entry.appearance[0] for entry in mode_palette(calibration).entries]
+
+    assert lightness[1] == pytest.approx(100.0)
+    assert lightness[2] > 100.0
+
+
 def test_mode_palette_dithers_each_swatch_to_its_entry() -> None:
     from epaper_dithering import DitherMode, DitherOptions, dither_image
 
