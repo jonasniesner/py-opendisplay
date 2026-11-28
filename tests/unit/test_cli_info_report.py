@@ -62,7 +62,7 @@ def _display(**overrides: Any) -> DisplayConfig:
         clk_pin=0x07,
         reserved_pins=b"\xff" * 7,
         full_update_mC=0,
-        reserved=b"\x00" * 13,
+        reserved=b"\x00" * 4,
     )
     base.update(overrides)
     return DisplayConfig(**base)

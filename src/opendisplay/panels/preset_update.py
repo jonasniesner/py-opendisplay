@@ -7,8 +7,9 @@ The rule of presets plan 2.9, shared by HA, the CLI and the website (its JS port
 - A bundled ``rev`` higher than the device's (0 = unknown = older than rev 1) whose
   ``min_firmware`` the device meets means an update is available.
 - 0xB1 ``drive_flags`` bit 0 (hand-edited) means the drive data is never offered an update.
-- Applying a drive update rewrites only the drive packets (0xAE/0xAF/0xB1 and type-level 0xB0);
-  a 0xB0 measured on this unit (``cal_flags`` bit 0) is never replaced.
+- Applying a drive update rewrites only the drive packets (0xAE/0xAF/0xB1 and type-level 0xB0),
+  plus the 0x20 frame layout when the entry has one; a 0xB0 measured on this unit (``cal_flags``
+  bit 0) is never replaced.
 - Experimental modes are written only on opt-in (``include_experimental``).
 
 The drive update is a :class:`~opendisplay.panels.migration.MigrationPlan`, applied with
@@ -32,6 +33,7 @@ from .migration import (
     _drive_packets,
     apply_migration,
     check_fits,
+    display_layout_fix,
     drive_ext_of,
     measured_calibrations,
     preset_packets,
@@ -208,6 +210,7 @@ def _plan_drive(  # pylint: disable=too-many-return-statements
         add, skipped = preset_packets(entry, include_experimental=include_experimental, keep=keep)
     except ValueError as err:
         return None, None, [f"drive preset {key:#06x}: {err}"]
+    scheme, layout = display_layout_fix(display, entry)
     plan = MigrationPlan(
         needed=True,
         blocked=False,
@@ -220,6 +223,8 @@ def _plan_drive(  # pylint: disable=too-many-return-statements
         kept=keep,
         skipped_experimental=skipped,
         needs_confirmation=entry.verified != "glass",
+        color_scheme=scheme,
+        frame_layout=layout,
     )
     problems = check_fits(_apply_plan(config, plan), profile, caps=db.caps)
     if problems:

@@ -39,6 +39,7 @@ from .enums import (
     get_board_type_name,
     get_manufacturer_name,
 )
+from .frame_layout import FrameLayout
 from .panel_drive import (
     PACKET_TYPE_ACTION_TABLE,
     PACKET_TYPE_DISPLAY_CALIBRATION,
@@ -341,7 +342,7 @@ class PowerOption:
 
 
 @dataclass
-class DisplayConfig:
+class DisplayConfig:  # pylint: disable=too-many-instance-attributes
     """Display configuration (TLV packet type 0x20, repeatable max 4).
 
     Size: 46 bytes (packed struct from firmware)
@@ -367,7 +368,20 @@ class DisplayConfig:
     clk_pin: int  # uint8
     reserved_pins: bytes  # 7 reserved pins
     full_update_mC: int  # uint16 (milli-coulombs per full update)
-    reserved: bytes  # 13 bytes
+    reserved: bytes  # 4 bytes (offsets 42-45); a reader must refuse non-zero ones
+    # Frame layout (protocol structs 2.5, offsets 33-41): the byte order the panel takes.
+    frame_split: int = 0  # uint8, FrameSplit
+    frame_scan: int = 0  # uint8, FrameScan bits
+    part_width: int = 0  # uint16 LE, px; 0 = pixel_width / parts
+    part_stride: int = 0  # uint16 LE, px; 0 = part_width
+    plane_invert: int = 0  # uint8, PlaneInvert bits
+    pixel_pack: int = 0  # uint8, PixelPack
+    row_order: int = 0  # uint8, RowOrder
+
+    @property
+    def frame_layout(self) -> FrameLayout:
+        """The frame layout fields, unchecked (``FrameLayout.check_defined`` refuses bad ones)."""
+        return FrameLayout.from_display(self)
 
     @property
     def supports_streaming_decompression(self) -> bool:
@@ -504,7 +518,14 @@ class DisplayConfig:
             clk_pin=data[23],
             reserved_pins=data[24:31],  # pins 2-8
             full_update_mC=int.from_bytes(data[31:33], "little"),
-            reserved=data[33:46],
+            frame_split=data[33],
+            frame_scan=data[34],
+            part_width=int.from_bytes(data[35:37], "little"),
+            part_stride=int.from_bytes(data[37:39], "little"),
+            plane_invert=data[39],
+            pixel_pack=data[40],
+            row_order=data[41],
+            reserved=data[42:46],
         )
 
 

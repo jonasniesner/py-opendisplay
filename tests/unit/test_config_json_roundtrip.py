@@ -76,7 +76,14 @@ def _display() -> DisplayConfig:
         clk_pin=6,
         reserved_pins=bytes([11, 12, 13, 14, 15, 16, 17]),
         full_update_mC=1234,
-        reserved=bytes(range(13)),
+        frame_split=1,
+        frame_scan=0x09,
+        part_width=400,
+        part_stride=392,
+        plane_invert=1,
+        pixel_pack=1,
+        row_order=2,
+        reserved=bytes(range(1, 5)),
     )
 
 
@@ -103,7 +110,28 @@ def test_display_pins_full_update_and_reserved_survive_json_roundtrip() -> None:
     d = back.displays[0]
     assert d.reserved_pins == bytes([11, 12, 13, 14, 15, 16, 17])
     assert d.full_update_mC == 1234
-    assert d.reserved == bytes(range(13))
+    assert d.frame_layout.to_mapping() == {
+        "frame_split": 1,
+        "frame_scan": 0x09,
+        "part_width": 400,
+        "part_stride": 392,
+        "plane_invert": 1,
+        "pixel_pack": 1,
+        "row_order": 2,
+    }
+    assert d.reserved == bytes(range(1, 5))
+
+
+def test_display_layout_is_read_from_a_13_byte_reserved_blob() -> None:
+    """An export from before the layout fields carries offsets 33-45 as one reserved blob."""
+    exported = config_to_json(_base_config(displays=[_display()]))
+    display = next(p for p in exported["packets"] if p["id"] == "32")
+    for name in ("frame_split", "frame_scan", "part_width", "part_stride", "plane_invert", "pixel_pack", "row_order"):
+        del display["fields"][name]
+    display["fields"]["reserved"] = "0x" + bytes([1, 9, 0x90, 0x01, 0x88, 0x01, 1, 1, 2, 1, 2, 3, 4]).hex()
+    d = config_from_json(exported).displays[0]
+    assert (d.frame_split, d.frame_scan, d.part_width, d.part_stride) == (1, 9, 400, 392)
+    assert (d.plane_invert, d.pixel_pack, d.row_order, d.reserved) == (1, 1, 2, bytes([1, 2, 3, 4]))
 
 
 def test_binary_input_pins_and_reserved_survive_json_roundtrip() -> None:
@@ -277,7 +305,7 @@ def test_legacy_zero_reserved_still_parses() -> None:
         if packet["name"] == "display":
             packet["fields"]["reserved"] = "0x0"
     back = config_from_json(data)
-    assert back.displays[0].reserved == bytes(13)
+    assert back.displays[0].reserved == bytes(4)
 
 
 # ─── Packets the library does not recognise (GlobalConfig.unparsed_tail) ─────

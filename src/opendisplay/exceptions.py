@@ -332,6 +332,10 @@ class ImageEncodingError(OpenDisplayError):
     pass
 
 
+class FrameLayoutError(ImageEncodingError, ValueError):
+    """A refused DisplayConfig frame layout: an undefined value, a reserved bit or byte, or a misfit geometry."""
+
+
 class OTANotSupportedError(OpenDisplayError):
     """OTA firmware update is not supported for this IC type."""
 

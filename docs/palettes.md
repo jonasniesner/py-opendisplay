@@ -21,7 +21,7 @@ colours on the wrong ink, and nothing raises an error.
 | `BWR` | black, white, red |
 | `BWY` | black, white, yellow |
 | `BWRY` | black, white, yellow, red |
-| `BWGBRY`, `BWGBRY_SPLIT` | black, white, yellow, red, blue, green |
+| `BWGBRY` | black, white, yellow, red, blue, green |
 | `SEVEN_COLOR` | black, white, yellow, red, blue, green, orange |
 | `GRAYSCALE_4` | black, gray1, gray2, white |
 | `GRAYSCALE_16` | black, gray1 … gray14, white |

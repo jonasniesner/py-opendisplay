@@ -16,6 +16,7 @@ from PIL import Image
 from opendisplay.device import prepare_image
 from opendisplay.models.capabilities import DeviceCapabilities
 from opendisplay.models.enums import ColorScheme
+from opendisplay.models.frame_layout import FrameLayout
 
 _SPECTRA6 = ["#000000", "#ffffff", "#ffff00", "#ff0000", "#0000ff", "#00ff00"]
 INKS = {
@@ -24,7 +25,6 @@ INKS = {
     "BWY": ["#000000", "#ffffff", "#ffff00"],
     "BWRY": ["#000000", "#ffffff", "#ffff00", "#ff0000"],
     "BWGBRY": _SPECTRA6,
-    "BWGBRY_SPLIT": _SPECTRA6,
     "SEVEN_COLOR": [*_SPECTRA6, "#ff8000"],
     "GRAYSCALE_4": ["#000000", "#555555", "#aaaaaa", "#ffffff"],
     "GRAYSCALE_16": ["#" + f"{i * 17:02x}" * 3 for i in range(16)],
@@ -52,10 +52,6 @@ GOLDEN_6X = [
     ("BWGBRY", None, DitherMode.BURKES, "45220dfe49d5"),
     ("BWGBRY", 35, DitherMode.NONE, "45220dfe49d5"),
     ("BWGBRY", 35, DitherMode.BURKES, "45220dfe49d5"),
-    ("BWGBRY_SPLIT", None, DitherMode.NONE, "e05ee7f16973"),
-    ("BWGBRY_SPLIT", None, DitherMode.BURKES, "e05ee7f16973"),
-    ("BWGBRY_SPLIT", 66, DitherMode.NONE, "e05ee7f16973"),
-    ("BWGBRY_SPLIT", 66, DitherMode.BURKES, "e05ee7f16973"),
     ("SEVEN_COLOR", None, DitherMode.NONE, "f6c713f72f73"),
     ("SEVEN_COLOR", None, DitherMode.BURKES, "f6c713f72f73"),
     ("GRAYSCALE_4", None, DitherMode.NONE, "f5d433d62721"),
@@ -77,5 +73,27 @@ def _stripes(inks: list[str]) -> Image.Image:
 def test_solid_inks_encode_as_on_6x(scheme: str, panel: int | None, mode: DitherMode, expected: str) -> None:
     img = _stripes(INKS[scheme])
     caps = DeviceCapabilities(width=img.width, height=img.height, color_scheme=ColorScheme[scheme])
+    data, _, _ = prepare_image(img, capabilities=caps, panel_ic_type=panel, dither_mode=mode, compress=False)
+    assert hashlib.sha1(data).hexdigest()[:12] == expected
+
+
+# Scheme 8 (BWGBRY_SPLIT) is retired; BWGBRY with frame_split HALVES sends the same bytes.
+GOLDEN_SPLIT = [
+    (None, DitherMode.NONE, "e05ee7f16973"),
+    (None, DitherMode.BURKES, "e05ee7f16973"),
+    (66, DitherMode.NONE, "e05ee7f16973"),
+    (66, DitherMode.BURKES, "e05ee7f16973"),
+]
+
+
+@pytest.mark.parametrize(("panel", "mode", "expected"), GOLDEN_SPLIT)
+def test_split_spectra_encodes_as_the_retired_scheme_8(panel: int | None, mode: DitherMode, expected: str) -> None:
+    img = _stripes(INKS["BWGBRY"])
+    caps = DeviceCapabilities(
+        width=img.width,
+        height=img.height,
+        color_scheme=ColorScheme.BWGBRY,
+        frame_layout=FrameLayout(frame_split=1),
+    )
     data, _, _ = prepare_image(img, capabilities=caps, panel_ic_type=panel, dither_mode=mode, compress=False)
     assert hashlib.sha1(data).hexdigest()[:12] == expected

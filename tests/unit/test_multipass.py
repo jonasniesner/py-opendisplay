@@ -14,7 +14,8 @@ from epaper_dithering import DitherMode
 from PIL import Image
 
 from opendisplay.encoding.multipass import encode_multipass, mode_palette
-from opendisplay.exceptions import ImageEncodingError
+from opendisplay.exceptions import FrameLayoutError, ImageEncodingError
+from opendisplay.models.frame_layout import FrameLayout
 from opendisplay.models.panel_drive import CalibrationEntry, DisplayCalibration
 
 
@@ -329,7 +330,7 @@ def test_exact_bytes_of_a_two_pass_spectra_frame() -> None:
 def test_split_panels_get_half_planes_per_pass() -> None:
     idx = np.array([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=np.uint8)
 
-    data = encode_multipass(idx, S6, passes=2, half_planes=True)
+    data = encode_multipass(idx, S6, passes=2, layout=FrameLayout(frame_split=1))
 
     # per pass: left halves of both rows, then right halves
     assert data == bytes([0x01, 0x32, 0x23, 0x10]) + bytes([0x45, 0x46, 0x64, 0x54])
@@ -340,9 +341,9 @@ def test_three_bit_codes_hold_at_most_five_passes() -> None:
         encode_multipass(np.zeros((1, 2), dtype=np.uint8), S6, passes=6)
 
 
-def _spectra_config(scheme: int = 8, mode_scheme: int = 0xFF, flags: int = FLAG_3BIT):
-    """The alpha fixture turned into a Spectra panel with a 2-pass mode 1 and a 3-bit palette."""
-    display = dataclasses.replace(ALPHA.displays[0], color_scheme=scheme)
+def _spectra_config(scheme: int = 4, mode_scheme: int = 0xFF, flags: int = FLAG_3BIT, frame_split: int = 1):
+    """The alpha fixture turned into a split Spectra panel with a 2-pass mode 1 and a 3-bit palette."""
+    display = dataclasses.replace(ALPHA.displays[0], color_scheme=scheme, frame_split=frame_split)
     packets = []
     for p in ALPHA.length_prefixed_packets:
         body = p.body
@@ -378,6 +379,13 @@ def test_a_spectra_split_mode_encodes_two_4bpp_passes() -> None:
     assert preview.size == (184, 360)
 
 
+def test_the_retired_split_scheme_is_refused_for_multipass() -> None:
+    config, mode = _spectra_config(scheme=8, frame_split=0)
+
+    with pytest.raises(FrameLayoutError, match="retired"):
+        prepare_multipass(_photo(), config, mode)
+
+
 def test_a_spectra_mode_with_two_bit_codes_is_refused() -> None:
     config, mode = _spectra_config(flags=0)
 
@@ -386,7 +394,7 @@ def test_a_spectra_mode_with_two_bit_codes_is_refused() -> None:
 
 
 def test_three_bit_codes_on_a_bwry_panel_are_refused() -> None:
-    config, mode = _spectra_config(scheme=3)
+    config, mode = _spectra_config(scheme=3, frame_split=0)
 
     with pytest.raises(ImageEncodingError, match="3-bit palette codes"):
         prepare_multipass(_photo(), config, mode)

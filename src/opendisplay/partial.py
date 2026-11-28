@@ -12,6 +12,7 @@ by a 4-byte big-endian length-prefixed ``last_image`` blob.
 
 from __future__ import annotations
 
+import logging
 import os
 import struct
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from PIL import Image
 from .encoding import encode_image
 from .models.config import DisplayConfig, GlobalConfig
 from .models.enums import ColorScheme, PartialUpdateSupport
+
+_LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Wire constants mirrored from the firmware partial-rendering protocol.
@@ -88,6 +91,18 @@ def compute_partial_region(
     # scheme is either rejected (ERR_PARTIAL_UNSUPPORTED) or aligns to 4/2 pixels
     # and gets ERR_RECT_ALIGN, so don't attempt a doomed partial round-trip.
     if color_scheme != ColorScheme.MONO:
+        return "fallback_full"
+
+    # A 0x76 rectangle is row-major; a frame layout that moves pixels has no such rectangle.
+    if display.frame_layout.reorders:
+        _LOGGER.info(
+            "Partial update skipped: the display's frame layout reorders the frame "
+            "(frame_split=%d, frame_scan=0x%02x, row_order=%d, pixel_pack=%d); sending a full frame",
+            display.frame_split,
+            display.frame_scan,
+            display.row_order,
+            display.pixel_pack,
+        )
         return "fallback_full"
 
     width, height = processed_image.size

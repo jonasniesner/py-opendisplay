@@ -5,8 +5,8 @@ the mode's calibration packet (0xB0): each entry has a CIELAB value and, per pas
 code that pass sends. The image is dithered against those colours, then every pass gets an
 ordinary frame of the panel's packing, and the frames are concatenated. BWRY16 codes are 2-bit
 and the frames 2 bpp; Spectra 6 codes are 3-bit (protocol structs 2.4,
-``OD_DRIVE_CAL_FLAG_CODES_3BIT``) and the frames 4 bpp nibbles, split into half planes on
-dual-controller panels (BWGBRY_SPLIT). No I/O.
+``OD_DRIVE_CAL_FLAG_CODES_3BIT``) and the frames 4 bpp nibbles. Each pass frame goes through
+the display's frame layout (``encoding.layout``) before the frames are concatenated. No I/O.
 """
 
 from __future__ import annotations
@@ -16,11 +16,10 @@ from typing import Final
 
 import numpy as np
 from epaper_dithering import Palette, PaletteEntry
-from PIL import Image
 
 from ..exceptions import ImageEncodingError
 from ..models.panel_drive import DisplayCalibration
-from .images import encode_2bpp, encode_4bpp
+from .layout import IDENTITY, FrameLayout, lay_out_plane
 
 MAX_PASSES: Final = 8  # CalibrationEntry.codes holds 2 bits for each of up to 8 passes (3 bits: 5)
 SCHEME_BWRY16: Final = 10  # the multi-pass scheme: 2 bpp per pass, colours from the 0xB0 palette
@@ -49,16 +48,23 @@ def mode_palette(calibration: DisplayCalibration) -> Palette:
 
 
 def encode_multipass(
-    indices: np.ndarray, calibration: DisplayCalibration, passes: int, *, half_planes: bool = False
+    indices: np.ndarray,
+    calibration: DisplayCalibration,
+    passes: int,
+    *,
+    layout: FrameLayout = IDENTITY,
+    white: int | None = None,
 ) -> bytes:
     """Encode palette indices (one per pixel, rows x columns) into ``passes`` concatenated frames.
 
     In pass ``p`` a pixel sends ``calibration.entries[index].code_for_pass(p)``: panel codes, to
     which ``code_map`` is never applied. 2-bit codes give 2 bpp frames; 3-bit codes give 4 bpp
-    nibble frames (high nibble first), as left then right half planes when ``half_planes``.
+    nibble frames (high nibble first). Each frame is laid out by ``layout``; ``white`` is the
+    code sent for columns past the panel's edge (default: the scheme's white, 1).
 
     Raises:
         ImageEncodingError: An index outside the palette, or more passes than the codes hold.
+        FrameLayoutError: A layout these frames cannot take.
     """
     limit = min(MAX_PASSES, calibration.max_passes)
     if not 1 <= passes <= limit:
@@ -69,9 +75,10 @@ def encode_multipass(
         raise ImageEncodingError(
             f"Palette index {int(indices.max())} is outside the mode's {len(calibration.entries)}-colour palette"
         )
+    bits = 4 if calibration.code_bits == 3 else 2
+    pad = 1 if white is None else white
     frames = []
     for pass_index in range(passes):
         table = np.array([e.code_for_pass(pass_index) for e in calibration.entries], dtype=np.uint8)
-        codes = Image.fromarray(table[indices], mode="P")
-        frames.append(encode_4bpp(codes, half_planes=half_planes) if calibration.code_bits == 3 else encode_2bpp(codes))
+        frames.append(lay_out_plane(table[indices] & ((1 << bits) - 1), bits, layout, white=pad))
     return b"".join(frames)

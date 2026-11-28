@@ -66,6 +66,40 @@ def _parse_hex_bytes(value: str | int, size: int) -> bytes:
     return raw[:size].ljust(size, b"\x00")
 
 
+_LAYOUT_FIELDS: tuple[str, ...] = (
+    "frame_split",
+    "frame_scan",
+    "part_width",
+    "part_stride",
+    "plane_invert",
+    "pixel_pack",
+    "row_order",
+)
+
+
+def _display_layout_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """The 0x20 frame layout and ``reserved[4]`` from a display packet's JSON fields.
+
+    An export without the named layout fields carries offsets 33-45 as one 13-byte ``reserved``
+    blob; the layout is read out of it so its bytes survive the round-trip.
+    """
+    if not any(name in fields for name in _LAYOUT_FIELDS):
+        blob = _parse_hex_bytes(fields.get("reserved", "0x0"), 13)
+        return {
+            "frame_split": blob[0],
+            "frame_scan": blob[1],
+            "part_width": int.from_bytes(blob[2:4], "little"),
+            "part_stride": int.from_bytes(blob[4:6], "little"),
+            "plane_invert": blob[6],
+            "pixel_pack": blob[7],
+            "row_order": blob[8],
+            "reserved": blob[9:13],
+        }
+    out: dict[str, Any] = {name: _parse_int(fields.get(name, "0")) for name in _LAYOUT_FIELDS}
+    out["reserved"] = _parse_hex_bytes(fields.get("reserved", "0x0"), 4)
+    return out
+
+
 def _parse_unparsed_tail(value: object) -> bytes:
     """Decode the exported ``unparsed_tail`` hex string; absent means no unrecognised packets."""
     if value is None:
@@ -238,6 +272,7 @@ def config_to_json(config: GlobalConfig) -> dict[str, Any]:
                         for i in range(7)
                     },
                     "full_update_mC": f"0x{display.full_update_mC:x}",
+                    **{name: str(getattr(display, name)) for name in _LAYOUT_FIELDS},
                     "reserved": _hex_bytes(display.reserved),
                 },
             }
@@ -627,7 +662,7 @@ def config_from_json(data: dict[str, Any]) -> GlobalConfig:
                         + [_parse_int(fields.get(f"reserved_pin_{i}", "0")) & 0xFF for i in range(3, 9)]
                     ),
                     full_update_mC=_parse_int(fields.get("full_update_mC", "0")),
-                    reserved=_parse_hex_bytes(fields.get("reserved", "0x0"), 13),
+                    **_display_layout_fields(fields),
                 )
             )
 

@@ -20,8 +20,9 @@ from ..encoding import (
     fit_image,
     normalize_source_image,
 )
+from ..encoding.layout import RETIRED_SPLIT_REASON, resolve_layout, scheme_geometry
 from ..encoding.multipass import SCHEME_BWRY16, encode_multipass, mode_palette
-from ..exceptions import ImageEncodingError
+from ..exceptions import FrameLayoutError, ImageEncodingError
 from ..models.capabilities import DeviceCapabilities
 from ..models.config import DisplayConfig, GlobalConfig
 from ..models.enums import ColorScheme, FitMode, Rotation
@@ -84,6 +85,7 @@ def _capabilities_from_config(config: GlobalConfig) -> DeviceCapabilities:
         color_scheme=color_scheme,
         rotation=rotation.value if isinstance(rotation, Rotation) else 0,
         bwry_codes=panel.code_map if panel is not None else None,
+        frame_layout=display.frame_layout,
     )
 
 
@@ -109,7 +111,6 @@ _DIRECT_WRITE_PIXELS_PER_BYTE: dict[ColorScheme, int] = {
     ColorScheme.BWY: 8,
     ColorScheme.BWRY: 4,
     ColorScheme.BWGBRY: 2,
-    ColorScheme.BWGBRY_SPLIT: 2,
     ColorScheme.SEVEN_COLOR: 2,
     ColorScheme.GRAYSCALE_16: 2,
 }
@@ -237,10 +238,13 @@ def prepare_image(
             a full panel.
 
     Returns:
-        Tuple of (uncompressed_data, compressed_data or None, processed_image)
+        Tuple of (uncompressed_data, compressed_data or None, processed_image). The data is laid
+        out by the display's frame layout (``capabilities.frame_layout``), so its size is the
+        laid-out frame size.
 
     Raises:
         RuntimeError: If config has no display information
+        FrameLayoutError: Color scheme 8 (retired), or a frame layout the scheme cannot take
         ValueError: If ``dither_mode`` is unknown, or ``tone``/``gamut`` is outside 0.0–1.0
         TypeError: If ``tone`` or ``gamut`` is not a number (e.g. the 6.x ``"auto"``)
     """
@@ -252,9 +256,12 @@ def prepare_image(
     if panel_ic_type is None and config is not None and config.displays:
         panel_ic_type = config.displays[0].panel_ic_type
 
+    color_scheme = capabilities.color_scheme
+    layout = capabilities.frame_layout
+    # Refuse a layout before the (slow) dither, not after it.
+    scheme_geometry(layout, color_scheme, capabilities.width, capabilities.height)
     image = _fit_for_display(image, capabilities, rotate, fit)
 
-    color_scheme = capabilities.color_scheme
     if color_scheme == ColorScheme.GRAYSCALE_4 and panel_ic_type is not None and panel_ic_type not in PANELS_4GRAY:
         _LOGGER.warning(
             "Panel IC 0x%04x is not a known 4-gray panel. GRAYSCALE_4 encoding may not display correctly.",
@@ -281,18 +288,18 @@ def prepare_image(
 
     # Encode to device format
     if color_scheme in (ColorScheme.BWR, ColorScheme.BWY):
-        plane1, plane2 = encode_bitplanes(dithered, color_scheme)
+        plane1, plane2 = encode_bitplanes(dithered, color_scheme, layout)
         image_data = plane1 + plane2
     elif color_scheme == ColorScheme.GRAYSCALE_4:
         # Two pre-split 1-bit planes concatenated; firmware streams the halves to PLANE_0/PLANE_1.
-        image_data = b"".join(encode_gray4_bitplanes(dithered, get_gray4_codes(panel_ic_type)))
+        image_data = b"".join(encode_gray4_bitplanes(dithered, get_gray4_codes(panel_ic_type), layout))
     elif color_scheme == ColorScheme.BWRY:
         # Some YR panels (0x001D) use a native 4-color code order with
         # yellow/red swapped relative to the dither palette; apply the per-panel
         # code table so the firmware's raw-nibble direct write shows the right color.
-        image_data = encode_2bpp(dithered, codes=_bwry_codes(capabilities, panel_ic_type))
+        image_data = encode_2bpp(dithered, codes=_bwry_codes(capabilities, panel_ic_type), layout=layout)
     else:
-        image_data = encode_image(dithered, color_scheme)
+        image_data = encode_image(dithered, color_scheme, layout)
 
     # Optionally compress
     compressed_data = None
@@ -349,14 +356,18 @@ def prepare_multipass(  # pylint: disable=too-many-arguments
     (``encoding.multipass``). A single-pass mode is its scheme's normal frame (``prepare_image``).
 
     Returns:
-        The uncompressed frames, concatenated, and the dithered preview.
+        The uncompressed frames, concatenated, and the dithered preview. Each pass frame is laid
+        out by the display's frame layout before the frames are concatenated.
 
     Raises:
+        FrameLayoutError: Color scheme 8 (retired), or a frame layout the frames cannot take.
         ImageEncodingError: A multi-pass mode without a 0xB0 calibration packet, a multi-pass mode
             that is neither BWRY16 (2-bit codes) nor a Spectra 6 mode inheriting the panel's scheme
             (3-bit codes), or a single-pass mode whose scheme is not the display's.
     """
     display_scheme = config.displays[0].color_scheme if config.displays else None
+    if display_scheme == ColorScheme.BWGBRY_SPLIT:
+        raise FrameLayoutError(RETIRED_SPLIT_REASON)
     if mode.passes <= 1 and mode.color_scheme not in (COLOR_SCHEME_INHERIT, display_scheme):
         raise ImageEncodingError(
             f"Drive mode '{mode.name}' renders scheme {mode.color_scheme}, not the display's scheme "
@@ -391,7 +402,7 @@ def prepare_multipass(  # pylint: disable=too-many-arguments
         )
     spectra = (
         mode.color_scheme in (COLOR_SCHEME_INHERIT, display_scheme)
-        and display_scheme in (ColorScheme.BWGBRY, ColorScheme.BWGBRY_SPLIT)
+        and display_scheme == ColorScheme.BWGBRY
         and calibration.code_bits == 3
     )
     bwry16 = mode.color_scheme == SCHEME_BWRY16 and calibration.code_bits == 2
@@ -401,11 +412,17 @@ def prepare_multipass(  # pylint: disable=too-many-arguments
             f"{calibration.code_bits}-bit palette codes on a scheme-{display_scheme} display; only BWRY16 "
             "(2-bit codes) and Spectra 6 modes inheriting the panel's scheme (3-bit codes) can be encoded"
         )
-    image = _fit_for_display(image, _capabilities_from_config(config), rotate, fit)
+    capabilities = _capabilities_from_config(config)
+    layout = capabilities.frame_layout
+    bits = 4 if spectra else 2
+    resolve_layout(layout, bits, capabilities.width, capabilities.height)
+    # Columns past the panel's edge get the display scheme's white: BWGBRY 1, BWRY its code_map's.
+    white = 1 if spectra else _bwry_codes(capabilities, config.displays[0].panel_ic_type)[1]
+    image = _fit_for_display(image, capabilities, rotate, fit)
     dithered = dither_image(
         image,
         mode_palette(calibration),
         DitherOptions(mode=dither_mode, serpentine=serpentine, exposure=exposure, saturation=saturation),
     )
-    split = spectra and display_scheme == ColorScheme.BWGBRY_SPLIT
-    return encode_multipass(np.asarray(dithered), calibration, mode.passes, half_planes=split), dithered
+    frames = encode_multipass(np.asarray(dithered), calibration, mode.passes, layout=layout, white=white)
+    return frames, dithered

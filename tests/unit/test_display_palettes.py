@@ -24,13 +24,12 @@ IDEAL_NAMES = {
     ColorScheme.BWY: ["black", "white", "yellow"],
     ColorScheme.BWRY: ["black", "white", "yellow", "red"],
     ColorScheme.BWGBRY: ["black", "white", "yellow", "red", "blue", "green"],
-    ColorScheme.BWGBRY_SPLIT: ["black", "white", "yellow", "red", "blue", "green"],
     ColorScheme.SEVEN_COLOR: ["black", "white", "yellow", "red", "blue", "green", "orange"],
     ColorScheme.GRAYSCALE_4: ["black", "gray1", "gray2", "white"],
     ColorScheme.GRAYSCALE_16: ["black"] + [f"gray{i}" for i in range(1, 15)] + ["white"],
 }
 
-MEASURED = [(35, ColorScheme.BWGBRY), (66, ColorScheme.BWGBRY_SPLIT), (55, ColorScheme.BWRY)]
+MEASURED = [(35, ColorScheme.BWGBRY), (66, ColorScheme.BWGBRY), (55, ColorScheme.BWRY)]
 
 
 def _names(palette: Palette) -> list[str | None]:
@@ -63,7 +62,7 @@ def test_palette_files_ship_with_the_package() -> None:
 
 
 def test_every_scheme_has_an_ideal_palette() -> None:
-    assert set(IDEAL_NAMES) == set(ColorScheme)
+    assert set(IDEAL_NAMES) == set(ColorScheme) - {ColorScheme.BWGBRY_SPLIT}
     for scheme, names in IDEAL_NAMES.items():
         palette = get_palette_for_display(None, scheme)
         assert _names(palette) == names, scheme
@@ -90,13 +89,18 @@ def test_measured_palettes(panel: int, scheme: ColorScheme) -> None:
 
 def test_spectra_panels_share_v2() -> None:
     a = get_palette_for_display(35, ColorScheme.BWGBRY).entries
-    b = get_palette_for_display(66, ColorScheme.BWGBRY_SPLIT).entries
+    b = get_palette_for_display(66, ColorScheme.BWGBRY).entries
     assert [e.appearance for e in a] == [e.appearance for e in b]
 
 
 @pytest.mark.parametrize(("panel", "scheme"), [(39, ColorScheme.MONO), (33, ColorScheme.BWR)])
 def test_dropped_placeholders_fall_back(panel: int, scheme: ColorScheme) -> None:
     assert get_palette_for_display(panel, scheme).measured is False
+
+
+def test_the_retired_split_scheme_has_no_palette() -> None:
+    with pytest.raises(ValueError, match="retired"):
+        get_palette_for_display(66, ColorScheme.BWGBRY_SPLIT)
 
 
 def test_use_measured_false() -> None:

@@ -22,6 +22,8 @@ from typing import Final
 
 from ..models.config import DisplayConfig, GlobalConfig
 from ..models.drive_ext import DRIVE_FLAG_HAND_EDITED, DriveExt, ModeExt, mode_tail_offset, with_drive_tail
+from ..models.enums import FrameSplit
+from ..models.frame_layout import FrameLayout
 from ..models.ident import FirmwareTarget
 from ..models.panel_drive import (
     PACKET_TYPE_DISPLAY_CALIBRATION,
@@ -78,6 +80,10 @@ class MigrationPlan:  # pylint: disable=too-many-instance-attributes
             palettes measured on this unit (``cal_flags`` bit 0), when the panel stays the same.
         skipped_experimental: ``mode_index`` values of experimental modes left out of ``add``
             because the caller did not opt in.
+        color_scheme: The value that replaces the display's ``color_scheme`` in 0x20, when it
+            changes (the retired scheme 8 becomes 4).
+        frame_layout: The frame layout written into the display's 0x20, when it changes (the
+            entry's ``frame_layout``, or HALVES for a scheme-8 config).
     """
 
     needed: bool
@@ -92,6 +98,50 @@ class MigrationPlan:  # pylint: disable=too-many-instance-attributes
     remap_panel_ic_type: int | None = None
     kept: tuple[LengthPrefixedPacket, ...] = ()
     skipped_experimental: tuple[int, ...] = ()
+    color_scheme: int | None = None
+    frame_layout: FrameLayout | None = None
+
+
+_RETIRED_SPLIT_SCHEME: Final = 8  # BWGBRY_SPLIT, protocol structs 2.5
+_SPLIT_LAYOUT: Final = FrameLayout(frame_split=FrameSplit.HALVES)
+
+
+def display_layout_fix(
+    display: DisplayConfig, entry: PanelEntry | NativeController | None
+) -> tuple[int | None, FrameLayout | None]:
+    """What a migration rewrites in a display's 0x20: ``(color_scheme, frame_layout)``, ``None`` = unchanged.
+
+    The retired scheme 8 becomes BWGBRY (4) with ``frame_split`` HALVES. An entry with a
+    ``frame_layout`` sets the layout (it wins over the HALVES default); one without leaves the
+    stored layout alone.
+    """
+    scheme = 4 if display.color_scheme == _RETIRED_SPLIT_SCHEME else None
+    wanted: FrameLayout | None = None
+    if isinstance(entry, PanelEntry) and entry.frame_layout is not None:
+        wanted = entry.frame_layout
+    elif scheme is not None:
+        wanted = _SPLIT_LAYOUT
+    if wanted is not None and wanted == display.frame_layout:
+        wanted = None
+    return scheme, wanted
+
+
+def _with_display_fix(plan: MigrationPlan, display: DisplayConfig, db: PanelDatabase) -> MigrationPlan:
+    """``plan`` with the 0x20 colour scheme and frame layout rewrites it needs; a changed 0x20 is a needed migration."""
+    if plan.blocked or plan.panel_ic_type is None:
+        return plan
+    entry = plan.entry if plan.entry is not None else db.entry_for(plan.panel_ic_type, plan.target_class)
+    scheme, layout = display_layout_fix(display, entry)
+    if scheme is None and layout is None:
+        return plan
+    what = []
+    if scheme is not None:
+        what.append(f"color scheme {display.color_scheme} becomes {scheme}")
+    if layout is not None:
+        what.append("the frame layout differs from the panel's preset")
+    note = "; ".join(what)
+    reason = f"{plan.reason}; {note}" if plan.needed else note
+    return dataclasses.replace(plan, needed=True, reason=reason, color_scheme=scheme, frame_layout=layout)
 
 
 def _limits(profile: DeviceProfile) -> tuple[int | None, bool | None]:
@@ -331,6 +381,8 @@ def plan_migration(
         include_experimental: Also write the entry's experimental modes (opt-in).
     """
     plan = _plan(config, profile, db, panel_ic_type, include_experimental)
+    if config is not None and config.displays and profile.generation is Generation.V3:
+        plan = _with_display_fix(plan, config.displays[0], db)
     if plan.blocked and profile.target is None:
         return dataclasses.replace(plan, reason=plan.reason + UNKNOWN_TARGET_NOTE)
     return plan
@@ -435,14 +487,29 @@ def _apply(config: GlobalConfig, plan: MigrationPlan) -> GlobalConfig:
     displays = list(config.displays)
     if plan.remap_panel_ic_type is not None and displays:
         displays[0] = dataclasses.replace(displays[0], panel_ic_type=plan.remap_panel_ic_type)
+    if plan.color_scheme is not None and displays:
+        displays[0] = dataclasses.replace(displays[0], color_scheme=plan.color_scheme)
+    if plan.frame_layout is not None and displays:
+        layout = plan.frame_layout
+        displays[0] = dataclasses.replace(
+            displays[0],
+            frame_split=layout.frame_split,
+            frame_scan=layout.frame_scan,
+            part_width=layout.part_width,
+            part_stride=layout.part_stride,
+            plane_invert=layout.plane_invert,
+            pixel_pack=layout.pixel_pack,
+            row_order=layout.row_order,
+            reserved=layout.reserved,
+        )
     return dataclasses.replace(config, length_prefixed_packets=packets, displays=displays)
 
 
 def apply_migration(config: GlobalConfig, plan: MigrationPlan) -> GlobalConfig:
-    """Apply a plan (od-v3.js ``applyMigration``): drop ``remove``, append ``add``, remap 0x20.
+    """Apply a plan (od-v3.js ``applyMigration``): drop ``remove``, append ``add``, rewrite 0x20.
 
     Every other packet is kept as it is; legacy packets are written back byte for byte except
-    the remapped ``panel_ic_type``.
+    the remapped ``panel_ic_type``, ``color_scheme`` and frame layout.
 
     Raises:
         ValueError: The plan is blocked, or a sequence in ``add`` does not run on its class.

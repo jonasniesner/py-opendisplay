@@ -17,6 +17,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Final
 
+from ..models.frame_layout import FrameLayout
 from ..models.ident import FirmwareTarget
 from ..models.panel_drive import (
     LUT_MAX_BYTES,
@@ -248,6 +249,8 @@ class PanelEntry:  # pylint: disable=too-many-instance-attributes
         changelog: The entry's changelog line for its current ``rev``, when the file has one.
         experimental_modes: ``mode_index`` values the file flags ``experimental``.
         experimental_note: What is unproven about the experimental modes.
+        frame_layout: The DisplayConfig frame layout the panel needs, when the file gives one
+            (``frame_layout`` object; a missing key is 0). ``None`` = the file says nothing.
     """
 
     panel_ic_type: int
@@ -269,6 +272,7 @@ class PanelEntry:  # pylint: disable=too-many-instance-attributes
     changelog: str | None = None
     experimental_modes: frozenset[int] = frozenset()
     experimental_note: str | None = None
+    frame_layout: FrameLayout | None = None
 
     @property
     def usable(self) -> bool:
@@ -381,6 +385,9 @@ def _drive_view(meta: Mapping[str, Any], src: Mapping[str, Any], target_class: T
             usable, reason = False, "Not available on this target: " + "; ".join(problems) + "."
     if not usable and reason is None:
         reason = _blocked_reason(src, status, target_class)
+    frame_layout, layout_problem = _frame_layout(src.get("frame_layout", meta.get("frame_layout")))
+    if layout_problem is not None:
+        usable, reason = False, f"The preset's frame_layout is not valid: {layout_problem}."
     drive_bytes = _num(src.get("drive_bytes"))
     return PanelEntry(
         panel_ic_type=meta["panel_ic_type"],
@@ -403,7 +410,22 @@ def _drive_view(meta: Mapping[str, Any], src: Mapping[str, Any], target_class: T
         changelog=src.get("changelog", meta.get("changelog")),
         experimental_modes=_experimental_modes(src) or _experimental_modes(meta.get("_modes_src") or {}),
         experimental_note=src.get("experimental_note", meta.get("experimental_note")),
+        frame_layout=frame_layout,
     )
+
+
+def _frame_layout(raw: Any) -> tuple[FrameLayout | None, str | None]:
+    """A preset's ``frame_layout`` object, or why it cannot be used."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, Mapping):
+        return None, f"expected an object, not {type(raw).__name__}"
+    try:
+        layout = FrameLayout.from_mapping(raw)
+        layout.check_defined()
+    except ValueError as err:
+        return None, str(err)
+    return layout, None
 
 
 @dataclass(frozen=True)
@@ -436,6 +458,7 @@ def _panel_from_generated(key: str, entry: Mapping[str, Any], panels: Mapping[st
         "min_firmware": src.get("min_firmware"),
         "changelog": src.get("changelog"),
         "experimental_note": src.get("experimental_note"),
+        "frame_layout": src.get("frame_layout"),
         "_modes_src": {"modes": src.get("modes") or []},
     }
     classes: dict[TargetClass, PanelEntry] = {}

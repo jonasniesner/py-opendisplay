@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .enums import ColorScheme
+from .frame_layout import IDENTITY, FrameLayout
 
 
 @dataclass
@@ -18,3 +19,5 @@ class DeviceCapabilities:
     # BWRY palette-index -> panel code, from display 0's 0xB1 code_map; None = the built-in table.
     # Firmware 3.0 stores code_map and does not apply it, so the host sends panel codes.
     bwry_codes: tuple[int, int, int, int] | None = None
+    # Display 0's frame layout (0x20, protocol structs 2.5); the default packs row-major.
+    frame_layout: FrameLayout = IDENTITY

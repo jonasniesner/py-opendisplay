@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 from typing import Final
 
 
@@ -21,6 +21,8 @@ class ColorScheme(IntEnum):
     GRAYSCALE_4 = 5
     GRAYSCALE_16 = 6
     SEVEN_COLOR = 7
+    # Retired (protocol structs 2.5): BWGBRY with DisplayConfig.frame_split = HALVES. Kept so an
+    # old config still parses and can be migrated; encoding refuses it.
     BWGBRY_SPLIT = 8
 
     @classmethod
@@ -55,6 +57,44 @@ class RefreshMode(IntEnum):
     FULL = 0
     FAST = 1
     PARTIAL = 2
+
+
+class FrameSplit(IntEnum):
+    """DisplayConfig.frame_split: how many controllers share the frame (protocol structs 2.5)."""
+
+    NONE = 0
+    HALVES = 1  # two parts side by side, left part first
+
+
+class RowOrder(IntEnum):
+    """DisplayConfig.row_order: the order of the rows inside each part."""
+
+    LINEAR = 0  # rows 0 .. h-1
+    FOLD = 1  # h-1, 0, h-2, 1, ...
+    INTERLEAVE = 2  # rows (y, y+1) as one stream: per column, code(x, y+1) then code(x, y)
+
+
+class PixelPack(IntEnum):
+    """DisplayConfig.pixel_pack: how pixel codes are packed into bytes."""
+
+    SCHEME = 0  # as the colour scheme packs them
+    NIBBLE = 1  # one pixel per nibble, the 2-bit code in the low bits
+
+
+class FrameScan(IntFlag):
+    """DisplayConfig.frame_scan bits; bits 4-7 are reserved."""
+
+    COLUMN_MAJOR = 1 << 0
+    MIRROR_X = 1 << 1
+    MIRROR_Y = 1 << 2
+    LSB_FIRST = 1 << 3
+
+
+class PlaneInvert(IntFlag):
+    """DisplayConfig.plane_invert bits; bits 2-7 are reserved."""
+
+    PLANE_0 = 1 << 0
+    PLANE_1 = 1 << 1
 
 
 class PartialUpdateSupport(IntEnum):
@@ -340,6 +380,7 @@ PANEL_IC_NAMES: Final[dict[int, str]] = {
     74: 'GDEP040E01 Spectra 6 4" 400x600',
     75: "Badger2350 B/W",
     76: "Badger2350 4-gray",
+    78: 'GDEY0579F52 5.79" BWRY',
     1000: 'UC8176 4.2" B/W',
     1001: 'SSD1619 4.2" B/W/R',
     1002: 'UC8176 4.2" B/W/R',

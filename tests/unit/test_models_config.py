@@ -57,7 +57,7 @@ def _display_config(active_width_mm: int, active_height_mm: int) -> DisplayConfi
         clk_pin=0,
         reserved_pins=b"\x00" * 7,
         full_update_mC=0,
-        reserved=b"\x00" * 13,
+        reserved=b"\x00" * 4,
     )
 
 

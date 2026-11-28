@@ -248,7 +248,9 @@ def serialize_display_config(config: DisplayConfig) -> bytes:
     - clk_pin: uint8
     - reserved_pins: 7 bytes
     - full_update_mC: uint16
-    - reserved: 13 bytes
+    - frame layout (9 bytes): frame_split, frame_scan, part_width (u16), part_stride (u16),
+      plane_invert, pixel_pack, row_order
+    - reserved: 4 bytes
 
     Args:
         config: DisplayConfig instance
@@ -286,9 +288,20 @@ def serialize_display_config(config: DisplayConfig) -> bytes:
     # firmware struct; omitting it truncates the packet and the device drops the display.
     data += struct.pack("<H", config.full_update_mC)
 
-    # Add reserved bytes (13) to total 46
-    reserved = config.reserved if config.reserved else b"\x00" * 13
-    return data + reserved[:13].ljust(13, b"\x00")
+    data += struct.pack(
+        "<BBHHBBB",
+        config.frame_split,
+        config.frame_scan,
+        config.part_width,
+        config.part_stride,
+        config.plane_invert,
+        config.pixel_pack,
+        config.row_order,
+    )
+
+    # reserved[4] to total 46
+    reserved = config.reserved if config.reserved else b"\x00" * 4
+    return data + reserved[:4].ljust(4, b"\x00")
 
 
 def serialize_led_config(config: LedConfig) -> bytes:

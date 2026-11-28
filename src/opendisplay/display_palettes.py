@@ -81,7 +81,6 @@ IDEAL_PALETTE_FILES: dict[ColorScheme, str] = {
     ColorScheme.BWY: "ideal_bwy.json",
     ColorScheme.BWRY: "ideal_bwry.json",
     ColorScheme.BWGBRY: "ideal_bwgbry.json",
-    ColorScheme.BWGBRY_SPLIT: "ideal_bwgbry.json",  # same inks; only the plane packing differs
     ColorScheme.SEVEN_COLOR: "ideal_seven_color.json",
     ColorScheme.GRAYSCALE_4: "ideal_grayscale_4.json",
     ColorScheme.GRAYSCALE_16: "ideal_grayscale_16.json",
@@ -91,10 +90,9 @@ IDEAL_PALETTE_FILES: dict[ColorScheme, str] = {
 MEASURED_PALETTE_FILES: dict[tuple[int, ColorScheme], str] = {
     # Spectra 6 7.3" (ep73_spectra_800x480).
     (35, ColorScheme.BWGBRY): "spectra6_7in3_v2.json",
-    # Spectra 6 13.3" dual-controller (T133A01, Seeed reTerminal E1004). Keyed on
-    # BWGBRY_SPLIT because firmware requires scheme 8 for split panels; same inks as the
+    # Spectra 6 13.3" dual-controller (T133A01, Seeed reTerminal E1004): same inks as the
     # 7.3", so it borrows that measurement until the T133A01 is measured.
-    (66, ColorScheme.BWGBRY_SPLIT): "spectra6_7in3_v2.json",
+    (66, ColorScheme.BWGBRY): "spectra6_7in3_v2.json",
     # 3.97" BWRY (ep397yr_800x480).
     (55, ColorScheme.BWRY): "ep397yr_bwry.json",
 }
@@ -118,9 +116,11 @@ def get_palette_for_display(
     so colours that request them come out solid.
 
     Raises:
-        ValueError: ``color_scheme`` is not a known wire value.
+        ValueError: ``color_scheme`` is not a known wire value, or is the retired scheme 8.
     """
     scheme = ColorScheme.from_value(int(color_scheme))
+    if scheme not in IDEAL_PALETTE_FILES:
+        raise ValueError(f"color scheme {scheme.name} has no palette; scheme 8 is retired (BWGBRY + frame_split)")
     if use_measured and panel_ic_type is not None:
         measured = MEASURED_PALETTE_FILES.get((panel_ic_type, scheme))
         if measured is not None:

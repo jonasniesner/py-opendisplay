@@ -97,6 +97,11 @@ def _print_plan(plan: MigrationPlan) -> None:
         )
     if plan.remap_panel_ic_type is not None:
         _console.print(f"Display panel id becomes {plan.remap_panel_ic_type:#06x}")
+    if plan.color_scheme is not None:
+        _console.print(f"Display color scheme becomes {plan.color_scheme}")
+    if plan.frame_layout is not None:
+        fields = ", ".join(f"{k}={v}" for k, v in plan.frame_layout.to_mapping().items() if v)
+        _console.print(f"Display frame layout becomes {fields or 'all zero'}")
     for packet in plan.add:
         _console.print(f"  Add    {_describe(packet)}")
     for packet in plan.remove:

@@ -19,6 +19,7 @@ from .. import redraw
 from ..credentials import DeviceKey
 from ..encoding import compress_image_data
 from ..encoding.compression import FIRMWARE_ZLIB_WINDOW_BITS
+from ..encoding.layout import scheme_geometry
 from ..exceptions import (
     AuthenticationRequiredError,
     IdentNotSupportedError,
@@ -45,13 +46,19 @@ if TYPE_CHECKING:
     from bleak.backends.device import BLEDevice
     from PIL import Image
 
-    from ..models.config import GlobalConfig
+    from ..models.config import DisplayConfig, GlobalConfig
     from ..models.firmware import FirmwareVersion
     from ..models.ident import DeviceIdent
     from ..models.panel_drive import DisplayMode
     from ..transport.base import Transport
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _frame_cells(display: DisplayConfig) -> int:
+    """Code cells of one laid-out frame plane: the pixel count, plus any padding columns of a split."""
+    return scheme_geometry(display.frame_layout, display.color_scheme, display.pixel_width, display.pixel_height).cells
+
 
 # Spectra and some other panels redraw for about 30 s after a config write and answer nothing
 # meanwhile; the read-back retries every 10 s, 9 times. Each attempt first waits out its own
@@ -275,7 +282,14 @@ class DisplayView:
         hold = drive_mode.ext.hold_codes if drive_mode.ext is not None else frozenset()
         display = config.displays[0] if config.displays else None
         etag_checked = self.checks_etag
-        use_prior = prior is not None and bool(hold) and drive_mode.passes <= 1 and display is not None
+        # An inverted plane would need its hold codes inverted too; such a panel redraws in full.
+        use_prior = (
+            prior is not None
+            and bool(hold)
+            and drive_mode.passes <= 1
+            and display is not None
+            and not display.plane_invert
+        )
         if use_prior and etag_checked and not prior_etag:
             raise PriorConflictError("the prior has no etag, so this firmware cannot confirm the panel still shows it")
         old_etag = prior_etag if use_prior and etag_checked else None
@@ -296,7 +310,7 @@ class DisplayView:
             )
             unmasked, changed = frames, None
             if use_prior and prior is not None and display is not None:
-                masked = mask_unchanged(frames, prior, hold, display.pixel_width * display.pixel_height)
+                masked = mask_unchanged(frames, prior, hold, _frame_cells(display))
                 frames, changed = masked.frame, masked.changed
             stream = (
                 compress_image_data(prefix + frames, level=6, window_bits=FIRMWARE_ZLIB_WINDOW_BITS)

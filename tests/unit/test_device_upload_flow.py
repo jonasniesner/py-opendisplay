@@ -114,7 +114,7 @@ def _make_config(
                 clk_pin=0,
                 reserved_pins=b"\x00" * 7,
                 full_update_mC=0,
-                reserved=b"\x00" * 13,
+                reserved=b"\x00" * 4,
             )
         ],
     )

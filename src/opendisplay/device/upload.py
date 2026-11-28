@@ -32,6 +32,7 @@ from ..models.config import (
 )
 from ..models.enums import (
     ColorScheme,
+    PlaneInvert,
     RefreshMode,
 )
 from ..partial import (
@@ -467,6 +468,10 @@ class Uploader:
             region.color_scheme,
         )
 
+        if display.plane_invert & PlaneInvert.PLANE_0:
+            # The panel takes its one plane bit-inverted, in a partial window as in a full frame.
+            old_rect_bytes = bytes(b ^ 0xFF for b in old_rect_bytes)
+            new_rect_bytes = bytes(b ^ 0xFF for b in new_rect_bytes)
         logical_stream = build_partial_logical_stream(old_rect_bytes, new_rect_bytes)
         # A partial stream rides inside the 0x76 initial bytes; firmware only
         # accepts a <= 9-bit zlib window, so always use a 9-bit window (a 15-bit

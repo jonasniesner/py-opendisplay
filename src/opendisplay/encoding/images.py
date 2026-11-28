@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from ..models.enums import ColorScheme, FitMode
+from .layout import IDENTITY, RETIRED_SPLIT_REASON, FrameLayout, FrameLayoutError, lay_out_plane
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -135,28 +136,34 @@ def fit_image(
 def encode_image(
     image: Image.Image,
     color_scheme: ColorScheme,
+    layout: FrameLayout = IDENTITY,
 ) -> bytes:
     """Encode image to display format based on color scheme.
 
     Args:
         image: Dithered palette image
         color_scheme: Display color scheme
+        layout: The display's frame layout (DisplayConfig 0x20); the default packs row-major.
 
     Returns:
         Encoded image bytes
+
+    Raises:
+        ValueError: A scheme this function does not pack.
+        FrameLayoutError: Scheme 8 (retired), or a layout the scheme cannot take.
     """
 
     if color_scheme == ColorScheme.MONO:
-        return encode_1bpp(image)
+        return encode_1bpp(image, layout)
     if color_scheme in (ColorScheme.BWR, ColorScheme.BWY):
         # 3-color displays use bitplane encoding (handled separately)
         raise ValueError(f"Color scheme {color_scheme.name} requires bitplane encoding, use encode_bitplanes() instead")
     if color_scheme == ColorScheme.BWRY:
-        return encode_2bpp(image)
+        return encode_2bpp(image, layout=layout)
     if color_scheme == ColorScheme.BWGBRY:
         # 6-color Spectra 6 display uses 4bpp with special firmware values
         # Palette indices 0-5 map to firmware values 0,1,2,3,5,6 (4 is skipped!)
-        return encode_4bpp(image, bwgbry_mapping=True)
+        return encode_4bpp(image, bwgbry_mapping=True, layout=layout)
     if color_scheme == ColorScheme.GRAYSCALE_4:
         # 4-gray needs two 1-bit controller planes, not packed 2bpp; the packed
         # form is not accepted by any firmware path. prepare_image routes 4-gray
@@ -166,47 +173,48 @@ def encode_image(
         )
     if color_scheme == ColorScheme.GRAYSCALE_16:
         # 16-level grayscale uses 4bpp; palette indices 0-15 map directly (0=black, 15=white)
-        return encode_4bpp(image)
+        return encode_4bpp(image, layout=layout, white=15)
     if color_scheme == ColorScheme.SEVEN_COLOR:
         # 7-color display uses 4bpp with an identity index map: firmware's
         # u8Colors_7clr table maps logical ink indices 0-6 straight through,
         # unlike BWGBRY whose firmware table skips value 4.
-        return encode_4bpp(image)
+        return encode_4bpp(image, layout=layout, white=1)
     if color_scheme == ColorScheme.BWGBRY_SPLIT:
-        # Same Spectra 6 inks and nibble remap as BWGBRY, but emitted plane-major:
-        # left half-plane (all rows) then right half-plane, so dual-CS panels
-        # (reTerminal E1004) stream CS1 then CS2. Dither output is byte-identical
-        # to BWGBRY; only the packing order differs.
-        return encode_4bpp(image, bwgbry_mapping=True, half_planes=True)
+        raise FrameLayoutError(RETIRED_SPLIT_REASON)
     raise ValueError(f"Unsupported color scheme: {color_scheme}")
 
 
-def encode_1bpp(image: Image.Image) -> bytes:
+def _palette_pixels(image: Image.Image) -> np.ndarray:
+    if image.mode != "P":
+        raise ValueError(f"Expected palette image, got {image.mode}")
+    return np.asarray(image)
+
+
+def encode_1bpp(image: Image.Image, layout: FrameLayout = IDENTITY) -> bytes:
     """Encode image to 1-bit-per-pixel format (monochrome).
 
-    Format: 8 pixels per byte, MSB first
-    Palette index 0 = black (0), index 1 = white (1)
+    Format: 8 pixels per byte, MSB first (unless ``layout`` says otherwise).
+    Palette index 0 = black (0), any other index = white (1).
 
     Args:
         image: Palette image (mode 'P')
+        layout: The display's frame layout.
 
     Returns:
         Encoded bytes
     """
-    if image.mode != "P":
-        raise ValueError(f"Expected palette image, got {image.mode}")
-
-    pixels = np.asarray(image)
-
-    # Any non-zero palette index = white (bit set). packbits(axis=1) zero-pads
-    # each row to a byte boundary, matching the per-row layout above.
-    return np.packbits(pixels > 0, axis=1).tobytes()
+    codes = (_palette_pixels(image) > 0).astype(np.uint8)
+    return lay_out_plane(codes, 1, layout, white=1)
 
 
-def encode_2bpp(image: Image.Image, codes: tuple[int, int, int, int] | None = None) -> bytes:
+def encode_2bpp(
+    image: Image.Image,
+    codes: tuple[int, int, int, int] | None = None,
+    layout: FrameLayout = IDENTITY,
+) -> bytes:
     """Encode image to 2-bits-per-pixel format (4 colors).
 
-    Format: 4 pixels per byte, MSB first
+    Format: 4 pixels per byte, MSB first (unless ``layout`` says otherwise).
     Each 2-bit value maps to palette index (0-3)
 
     Args:
@@ -214,63 +222,46 @@ def encode_2bpp(image: Image.Image, codes: tuple[int, int, int, int] | None = No
         codes: Optional palette-index -> stored-nibble table. Used by BWRY panels
             whose native 4-color code order differs from the dither palette order
             (e.g. yellow/red swapped). Defaults to identity.
+        layout: The display's frame layout; padding columns get the code of white (index 1).
 
     Returns:
         Encoded bytes
     """
-    if image.mode != "P":
-        raise ValueError(f"Expected palette image, got {image.mode}")
-
-    pixels = np.asarray(image)
-    height, width = pixels.shape
-
-    # Mask to 2 bits, remap through the panel code table if given, zero-pad the
-    # width to a multiple of 4 (matches the per-row byte boundary), then pack
-    # 4 pixels per byte MSB-first.
-    p = (pixels & 0x03).astype(np.uint8)
+    p = (_palette_pixels(image) & 0x03).astype(np.uint8)
+    white = 1
     if codes is not None:
-        p = np.asarray(codes, dtype=np.uint8)[p]
-    pad = (-width) % 4
-    if pad:
-        p = np.pad(p, ((0, 0), (0, pad)))
-    p = p.reshape(height, -1, 4)
-    packed = (p[:, :, 0] << 6) | (p[:, :, 1] << 4) | (p[:, :, 2] << 2) | p[:, :, 3]
-    return packed.astype(np.uint8).tobytes()
+        table = np.asarray(codes, dtype=np.uint8)
+        p = table[p]
+        white = int(table[1])
+    return lay_out_plane(p, 2, layout, white=white)
 
 
 def encode_4bpp(
     image: Image.Image,
     bwgbry_mapping: bool = False,
-    half_planes: bool = False,
+    layout: FrameLayout = IDENTITY,
+    white: int | None = None,
 ) -> bytes:
     """Encode image to 4-bits-per-pixel format (16 colors).
 
-    Format: 2 pixels per byte, MSB first
+    Format: 2 pixels per byte, high nibble first (unless ``layout`` says otherwise).
     Each 4-bit value maps to palette index (0-15)
 
-    Used for BWGBRY (6-color Spectra 6) and GRAYSCALE_16 (16-level grayscale).
-    For GRAYSCALE_16, palette indices 0-15 map directly to firmware values
+    Used for BWGBRY (6-color Spectra 6), SEVEN_COLOR and GRAYSCALE_16. For
+    GRAYSCALE_16, palette indices 0-15 map directly to firmware values
     (0=black, 15=white), so no remapping is needed.
 
     Args:
         image: Palette image (mode 'P')
         bwgbry_mapping: If True, remap palette indices for BWGBRY firmware
                         (0→0, 1→1, 2→2, 3→3, 4→5, 5→6)
-        half_planes: If True (firmware color_scheme 8 / BWGBRY_SPLIT), pack the
-                     left half-plane first (all rows), then the right half-plane,
-                     so dual-CS panels can stream CS1 then CS2 without a
-                     framebuffer.
+        layout: The display's frame layout.
+        white: The code sent for padding columns; default 1 with ``bwgbry_mapping``, else 15.
 
     Returns:
         Encoded bytes
     """
-    if image.mode != "P":
-        raise ValueError(f"Expected palette image, got {image.mode}")
-
-    pixels = np.asarray(image)
-    _height, width = pixels.shape
-
-    idx = (pixels & 0x0F).astype(np.uint8)
+    idx = (_palette_pixels(image) & 0x0F).astype(np.uint8)
 
     # BWGBRY firmware color mapping (Spectra 6 display): palette indices to
     # firmware values 0→0, 1→1, 2→2, 3→3, 4→5, 5→6, everything else → 0
@@ -278,19 +269,6 @@ def encode_4bpp(
     if bwgbry_mapping:
         lut = np.array([0, 1, 2, 3, 5, 6] + [0] * 10, dtype=np.uint8)
         idx = lut[idx]
-
-    def _pack_plane(plane: np.ndarray) -> bytes:
-        # Zero-pad width to an even number (per-row byte boundary), then pack
-        # 2 pixels per byte, high nibble first.
-        h, w = plane.shape
-        p = plane
-        if w & 1:
-            p = np.pad(p, ((0, 0), (0, 1)))
-        p = p.reshape(h, -1, 2)
-        packed = (p[:, :, 0] << 4) | p[:, :, 1]
-        return bytes(packed.astype(np.uint8).tobytes())
-
-    if half_planes:
-        mid = width // 2
-        return _pack_plane(idx[:, :mid]) + _pack_plane(idx[:, mid:])
-    return _pack_plane(idx)
+    if white is None:
+        white = 1 if bwgbry_mapping else 15
+    return lay_out_plane(idx, 4, layout, white=white)

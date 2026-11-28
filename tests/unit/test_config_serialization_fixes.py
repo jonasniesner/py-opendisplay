@@ -46,8 +46,11 @@ def test_public_sizes_match_firmware() -> None:
 def test_display_config_from_bytes_parses_46_byte_packet() -> None:
     data = bytes(range(46))
     cfg = DisplayConfig.from_bytes(data)
-    assert cfg.reserved == data[33:46]
-    assert len(cfg.reserved) == 13
+    assert (cfg.frame_split, cfg.frame_scan) == (33, 34)
+    assert cfg.part_width == int.from_bytes(data[35:37], "little")
+    assert cfg.part_stride == int.from_bytes(data[37:39], "little")
+    assert (cfg.plane_invert, cfg.pixel_pack, cfg.row_order) == (39, 40, 41)
+    assert cfg.reserved == data[42:46]
 
 
 def test_data_bus_from_bytes_yields_full_14_byte_reserved() -> None:

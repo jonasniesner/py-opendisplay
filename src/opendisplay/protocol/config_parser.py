@@ -451,7 +451,8 @@ def _parse_display_config(data: bytes) -> DisplayConfig:
 
     reserved_pins = data[24:31]  # 7 reserved pin bytes
     full_update_mC = int.from_bytes(data[31:33], "little") if len(data) >= 33 else 0
-    reserved = data[33:] if len(data) >= 33 else data[31:]
+    # Frame layout (structs 2.5, offsets 33-41) then reserved[4]; a short packet leaves them 0.
+    tail = data[33:46].ljust(13, b"\x00") if len(data) >= 33 else bytes(13)
 
     return DisplayConfig(
         instance_number=instance_num,
@@ -474,7 +475,14 @@ def _parse_display_config(data: bytes) -> DisplayConfig:
         clk_pin=clk_pin,
         reserved_pins=reserved_pins,
         full_update_mC=full_update_mC,
-        reserved=reserved,
+        frame_split=tail[0],
+        frame_scan=tail[1],
+        part_width=int.from_bytes(tail[2:4], "little"),
+        part_stride=int.from_bytes(tail[4:6], "little"),
+        plane_invert=tail[6],
+        pixel_pack=tail[7],
+        row_order=tail[8],
+        reserved=tail[9:13],
     )
 
 

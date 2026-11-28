@@ -80,7 +80,7 @@ def _config(
                 clk_pin=0,
                 reserved_pins=b"\x00" * 7,
                 full_update_mC=0,
-                reserved=b"\x00" * 13,
+                reserved=b"\x00" * 4,
             )
         ],
     )
@@ -97,7 +97,7 @@ def _stub_prepare_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         "opendisplay.device.imaging.encode_image",
-        lambda image, color_scheme: b"\x01\x02",
+        lambda image, color_scheme, layout: b"\x01\x02",
     )
 
 
